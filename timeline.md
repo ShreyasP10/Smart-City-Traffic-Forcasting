@@ -139,6 +139,20 @@ Workspace: `Smart City Traffic Forcasting/`
 - Other session's retrain moved base MAE 252.5→286.3, RMSE 436.9→509.8, thresholds → [1186, 3378, 4939], transfer 2220→595 becomes 2240→604 (still 73% drop), sanity 5649.82→5484.45 (still Severe ✅).
 - Updated README quickstart/table/demo-tour numbers. Older timeline/issues entries keep original figures (accurate at their time).
 
+## 12:30–12:40 — React UI (user: "use react bro")
+- Stack confirmed ready (Node 22, npm 10, FastAPI + uvicorn present).
+- Created `api.py`: 8 endpoints reusing canonical `pipeline.predict_pipeline` verbatim
+  (health/cities/thresholds/overview/forecast/heatmap/patterns/adaptation/compare), CORS open,
+  keys from env → secrets.toml, numpy/datetime-safe serialization.
+- Scaffolded `frontend/` (Vite React): `api.js` client, 6 views mirroring Streamlit tabs
+  (Overview cards + SHAP bars, Forecast table + 3-line chart, Leaflet OSM heatmap,
+  Patterns lines/bars/heat-grid, Adaptation stages + collector chart, Compare + recommendation),
+  dark CSS, dev proxy `/api` → :8000.
+- Verified: `npm run build` ✅ 6s; all 8 endpoints live-tested (heatmap 5 pts, patterns 24h,
+  collector 30 rows, compare best correct). Backend runs simulated (secrets empty).
+- Note: PS background jobs don't survive between commands — backend must run in a real
+  terminal (`uvicorn api:app --port 8000`), not a job.
+
 ## 12:15 — Crash triage from your run log (3 fixes, all verified)
 - `requirements.txt` had `"""docstring"""` header lines → pip `Invalid requirement`. Rewrote as pure `#` comments + pins; dropped `shap` (optional fallback exists, heavy Windows build). `pip install -r` now all-satisfied.
 - `app.py:77` `NameError: featurize_point` (other session's import gap) → added to the `from schema import` line.
@@ -184,4 +198,19 @@ Workspace: `Smart City Traffic Forcasting/`
   - **W1 (Zero Temporal Leakage):** Replaced shuffled splits with strict chronological temporal ordering (past 80% train / future 20% test; Out-of-Time MAE 286.26, RMSE 509.83).
   - **W3, W7, W10 (Unified Prediction Pipeline):** Built `pipeline.py` shared identically across CLI `predict.py` and Streamlit `app.py`. Added physical volume/ratio clipping and exponential horizon decay (`w_live = 0.35 * exp(-m/45)`), resolving flat forward forecasts across T+0..60.
   - **W5, W6, W8, W9, W11 (Subsystem Isolation & Verification):** Subsystem-isolated caches with atomic `.tmp` replacement, timezone localization via `ZoneInfo`, SHA-256 model integrity verification (`models/checksums.json`), server-side secret loading, and live-only collector visualization.
+
+## 13:00–13:15 — Comprehensive Technical Audit Hardening & Unit Testing (W1–W8 & S1–S7)
+- **W1 (Exact Waterfall Additivity):** Added raw unclipped floats in `pipeline.py`, explicit intra-hour linear interpolation (`interp_delta`), and captured physical bounding and integer display rounding in `clip_delta`. Telescoping steps sum with 100% mathematical equality to `final_vol`.
+- **W2 (Safe Model Loading & Threat Model):** Pinned SHA-256 with optional `MODEL_SHA256` environment variable and documented threat boundaries.
+- **W3 & W4 (Dataset Transparency):** Rendered US historical source dataset (`us_df`) in Tab 4 Patterns as the model's true training distribution, clearly separating the synthetic Indian adaptation benchmark.
+- **W5 (Live Fusion Capacity & Sub-Hour Linear Interpolation):** Replaced hardcoded scale with empirical `p95_volume` from training metrics; added continuous sub-hour linear interpolation between hour boundaries in `pipeline.py`.
+- **W6 (Cache Fallback Recovery):** Replaced unreachable exceptions with explicit `ok: False` checks and keyed cache by geographic coordinate (`{lat:.3f},{lon:.3f}`).
+- **W7 (Streamlit Redundant Query Caching):** Wrapped weather and flow in `@st.cache_data` (ttl=300 and ttl=60).
+- **W8 (City-Specific Holidays):** Injected `city` parameter into `featurize_point()` and `predict_pipeline()`, evaluating Indian vs US holidays context-specifically.
+- **S1–S7 (Code Hygiene & Unit Test Suite):**
+  - Corrected WMO code 2 from `"Mist"` to `"Clouds"` in `_open_meteo()`.
+  - Versioned synthetic datasets to `_v2.csv` and fixed inverted synthetic peak shift.
+  - Removed key prefix characters from `collector.py` terminal prints.
+  - Added naive historical (Hour × Day) baseline benchmark in `train_base.py` (XGBoost achieves 4.5% error reduction over baseline).
+  - Created automated unit test suite `test_suite.py` with 6 comprehensive test cases (all 6 pass ✅).
 

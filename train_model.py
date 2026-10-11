@@ -28,9 +28,8 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 def main() -> None:
     os.makedirs(MODEL_DIR, exist_ok=True)
     us = add_features(load_historical(indian_style=False))
-    # Strict chronological sort
     if "date_time" in us.columns:
-        us = us.sort_values("date_time").reset_index(drop=True)
+        us = us.drop_duplicates(subset=["date_time"]).sort_values("date_time").reset_index(drop=True)
 
     india_small = add_features(load_historical(indian_style=True)).iloc[:24 * 14].copy()
 
@@ -115,7 +114,10 @@ def main() -> None:
     # Calculate and store model integrity SHA-256
     sha = compute_sha256(joblib_path)
     checksums_file = os.path.join(MODEL_DIR, "checksums.json")
-    cur_checksums = json.load(open(checksums_file)) if os.path.exists(checksums_file) else {}
+    cur_checksums = {}
+    if os.path.exists(checksums_file):
+        with open(checksums_file, "r") as f:
+            cur_checksums = json.load(f)
     cur_checksums["traffic_model.joblib"] = sha
     with open(checksums_file, "w") as f:
         json.dump(cur_checksums, f, indent=2)

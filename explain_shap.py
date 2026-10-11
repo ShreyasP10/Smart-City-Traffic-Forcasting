@@ -43,6 +43,7 @@ def compute_shap_explanation(
     bundle: dict,
     horizon_min: int = 0,
     pipeline_pred: dict | None = None,
+    city: str = "Mumbai",
 ) -> dict:
     """Computes exact SHAP values, semantic feature groupings, and end-to-end pipeline attribution."""
     target_dt = at + dt.timedelta(minutes=horizon_min) if horizon_min != 0 else at
@@ -52,10 +53,11 @@ def compute_shap_explanation(
     # If full pipeline forecast not supplied, compute canonically
     if pipeline_pred is None:
         from pipeline import predict_pipeline
-        pipeline_pred = predict_pipeline(at, weather, flow, bundle, minutes_ahead=horizon_min)
+        pipeline_pred = predict_pipeline(at, weather, flow, bundle, minutes_ahead=horizon_min, city=city)
 
-    # Canonical feature vector
-    X, row = featurize_point(target_dt, weather)
+    # Canonical feature vector evaluated at hour baseline for tree explainer
+    h0 = target_dt.replace(minute=0, second=0, microsecond=0)
+    X, row = featurize_point(h0, weather, city=city)
     hour = target_dt.hour
     dow = target_dt.weekday()
 
@@ -134,11 +136,15 @@ def compute_shap_explanation(
         {"name": "Holiday Factor", "detail": hol_desc, "impact": hol_impact},
     ]
 
-    # Model predicted base volume (sum of pure SHAP matches model output exactly)
-    pred_base_vol = float(pipeline_pred["base_vol"])
-    calib_delta = float(pipeline_pred["adapted_vol"] - pipeline_pred["base_vol"])
-    fusion_delta = float(pipeline_pred["final_vol"] - pipeline_pred["adapted_vol"])
+    # Pipeline raw floats for 100% exact mathematical additivity
+    raw = pipeline_pred.get("raw", {})
+    raw_base = float(raw.get("base", pipeline_pred["base_vol"]))
+    feature_shap_total = base_val + sum(g["impact"] for g in feature_groups)
+    interp_delta = raw_base - feature_shap_total
+    calib_delta = float(raw.get("adapted", pipeline_pred["adapted_vol"]) - raw_base)
+    fusion_delta = float(raw.get("final", pipeline_pred["final_vol"]) - raw.get("adapted", pipeline_pred["adapted_vol"]))
     final_vol = float(pipeline_pred["final_vol"])
+    clip_delta = final_vol - float(raw.get("final", pipeline_pred["final_vol"]))
 
     # Pipeline adjustment stages
     ratio = float(pipeline_pred.get("congestion_ratio", flow.get("congestion_ratio", 0.7)))
@@ -207,16 +213,44 @@ def compute_shap_explanation(
 
     headline_sentence = ", ".join(headline_parts[:2]) if headline_parts else "Traffic is at baseline levels"
 
+    waterfall_steps = [
+        {"name": g["name"], "detail": g.get("detail", ""), "impact": g["impact"]}
+        for g in feature_groups
+    ]
+    waterfall_steps.append({
+        "name": "Intra-Hour Trend",
+        "detail": f"Sub-hour progression ({interp_delta:+.0f} veh/hr)",
+        "impact": interp_delta,
+    })
+    waterfall_steps.append({
+        "name": "India Context Calibration",
+        "detail": "Transfer adaptation",
+        "impact": calib_delta,
+    })
+    waterfall_steps.append({
+        "name": "Live TomTom Speed Fusion",
+        "detail": "TomTom sensor fusion",
+        "impact": fusion_delta,
+    })
+    waterfall_steps.append({
+        "name": "Physical Bounds",
+        "detail": f"Corridor capacity clipping ({clip_delta:+.0f} veh/hr)",
+        "impact": clip_delta,
+    })
+
     return {
         "target_dt": target_dt,
         "horizon_min": horizon_min,
         "base_expected_value": base_val,
-        "predicted_volume": pred_base_vol,
+        "predicted_volume": raw_base,
         "final_forecast": final_vol,
+        "interp_delta": interp_delta,
         "calibration_delta": calib_delta,
         "fusion_delta": fusion_delta,
+        "clip_delta": clip_delta,
         "feature_groups": feature_groups,
         "pipeline_stages": pipeline_stages,
+        "waterfall_steps": waterfall_steps,
         "groups": groups,
         "headline_sentence": headline_sentence,
         "summary_text": summary_text,
@@ -224,19 +258,22 @@ def compute_shap_explanation(
         "raw_shap": feature_shap,
         "total_upward_impact": total_pos,
         "total_downward_impact": total_neg,
+        "city": city,
     }
 
 
 def plot_shap_waterfall_chart(explanation: dict) -> go.Figure:
     """Generates an intuitive Plotly Waterfall chart with 100% mathematical integrity.
 
-    Traces: Baseline Average -> Pure SHAP Feature Attributions -> India Calibration -> Live Speed Fusion -> Final Forecast.
+    Traces: Baseline Average -> Pure SHAP Feature Attributions -> Intra-hour Trend -> India Calibration -> Live Speed Fusion -> Bounds Clipping -> Final Forecast.
     All bars add up with exact arithmetic equality.
     """
     feature_groups = explanation["feature_groups"]
     base_val = explanation["base_expected_value"]
+    interp_delta = explanation.get("interp_delta", 0.0)
     calib_delta = explanation["calibration_delta"]
     fusion_delta = explanation["fusion_delta"]
+    clip_delta = explanation.get("clip_delta", 0.0)
     final_vol = explanation["final_forecast"]
 
     # Select prominent feature drivers
@@ -245,12 +282,20 @@ def plot_shap_waterfall_chart(explanation: dict) -> go.Figure:
     other_feature_impact = sum(g["impact"] for g in sorted_features[5:])
 
     steps = list(top_features)
-    if abs(other_feature_impact) > 1.0:
+    if abs(other_feature_impact) > 0.001:
         steps.append({"name": "Other Model Features", "detail": "Combined minor features", "impact": other_feature_impact})
+
+    # Add intra-hour temporal interpolation if present
+    if abs(interp_delta) > 0.001:
+        steps.append({"name": "Intra-Hour Trend", "detail": f"Sub-hour progression ({interp_delta:+.0f} veh/hr)", "impact": interp_delta})
 
     # Add transparent post-model pipeline steps
     steps.append({"name": "India Calibration", "detail": "Transfer adaptation", "impact": calib_delta})
     steps.append({"name": "Live Speed Fusion", "detail": "TomTom sensor fusion", "impact": fusion_delta})
+
+    # Add physical bounds clipping & integer rounding if active
+    if abs(clip_delta) > 0.001:
+        steps.append({"name": "Bounds & Rounding", "detail": f"Capacity clipping / integer display ({clip_delta:+.0f} veh/hr)", "impact": clip_delta})
 
     names = ["Baseline Average"] + [s["name"] for s in steps] + ["Final Forecast"]
     measures = ["absolute"] + ["relative"] * len(steps) + ["total"]

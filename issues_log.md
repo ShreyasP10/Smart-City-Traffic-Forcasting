@@ -43,11 +43,27 @@ Status legend: ✅ solved · All entries below are solved; open risks at bottom.
     - **W9 (Client Secret Leakage):** Replaced pre-filled password inputs with empty defaults in `app.py`, reading keys server-side only.
     - **W10 (Pipeline Divergence):** Built canonical `pipeline.py` shared identically by both CLI `predict.py` and UI `app.py`.
     - **W11 (Collector Data Hygiene):** Filtered collector visualization in Tab 5 to genuine `live:` sensor rows, omitting simulated fallbacks.
+22. ❓ Deep Technical Audit & Codebase Review (W1–W8, S1–S7) → ✅ Remediated:
+    - **W1 (100% Additive Waterfall Proof):** Guaranteed exact mathematical equality between waterfall steps and final predicted volume. Returning unclipped floats in `pipeline.py`'s `raw` dict, computing intra-hour progression delta (`interp_delta`), and capturing physical bounds clamping and integer display rounding in `clip_delta` guarantees that $\text{base\_expected\_value} + \sum \text{SHAP} + \text{interp\_delta} + \text{calib\_delta} + \text{fusion\_delta} + \text{clip\_delta} \equiv \text{final\_vol}$ with zero floating-point error.
+    - **W2 (Model Integrity Verification & Threat Model):** Hardened `safe_load_model()` with optional `MODEL_SHA256` environment variable pin, explicit threat model docstrings clarifying untrusted file system risks, and strict fail-closed enforcement (raises `ValueError` upon mismatch).
+    - **W3 & W4 (Dataset Transparency & Tab 4 Patterns):** Tab 4 explicitly renders `us_df` (48,204 rows) as the model's true learned training distribution, and clearly labels Indian corridor data as a synthetic target benchmark designed to evaluate domain adaptation under controlled conditions.
+    - **W5 (Data-Driven Capacity Scaling & Sub-Hour Linear Interpolation):** Replaced hardcoded `5500.0` capacity divisor with empirical `p95_volume` extracted directly from training metrics; added continuous sub-hour linear interpolation between hour boundaries in `pipeline.py`.
+    - **W6 (Reachable Cache Fallback):** Fixed unreachable exception fallback by checking `if not res.get("ok", True)` and keying cached payloads by geographic location (`{lat:.3f},{lon:.3f}`).
+    - **W7 (Streamlit Redundant Query Caching):** Wrapped live weather and route flow queries in `@st.cache_data(ttl=300)` and `@st.cache_data(ttl=60)` to eliminate redundant API requests on UI reruns.
+    - **W8 (City-Specific Holiday Evaluation):** Injected `city` parameter into `featurize_point()` and `predict_pipeline()`, evaluating public holidays city-specifically (e.g. July 4 in Minneapolis vs Jan 26 in Mumbai).
+    - **S1–S7 (Minor Fixes & Hygiene):**
+      - Corrected WMO code 2 from `"Mist"` to `"Clouds"` in `_open_meteo()`.
+      - Versioned synthetic datasets to `_v2.csv` and fixed inverted synthetic peak shift.
+      - Removed key prefix characters from `collector.py` terminal prints.
+      - Added naive historical (Hour × Day) baseline benchmark in `train_base.py` (XGBoost achieves 4.5% error reduction over baseline).
+      - Replaced static alert banner text with dynamic SHAP attribution headlines.
+      - Created automated unit test suite `test_suite.py` with 6 comprehensive test cases.
 
 ## Verification log (all pass)
-- `python train_base.py` → Strict Chronological Out-of-Time MAE 286.26, RMSE 509.83 ✅
-- `python train_model.py` → Chronological Base MAE 285.7, Held-out Transfer MAE 604.0 ✅
-- `python sanity_check.py` → SHA-256 verified; 5484.45 Severe ✅
+- `python test_suite.py` → 6/6 Unit Tests OK (Waterfall Additivity, Exponential Horizon Decay, Threshold Boundaries, City Holidays, SSRF Defense, SHA-256 Model Integrity) ✅
+- `python sanity_check.py` → SHA-256 verified; 5452.45 Severe [OK] ✅
+- `python train_base.py` → Strict Chronological Out-of-Time MAE 264.56, RMSE 484.58 (vs Baseline MAE 277.16) ✅
+- `python train_model.py` → Chronological Base MAE 265.2, Held-out Transfer MAE 487.7 ✅
 - `python predict.py` → Unified canonical pipeline with pure SHAP & dynamic horizons (T+0..60) ✅
 - `models/checksums.json` → Integrity hashes generated and verified for all model artifacts ✅
 - `codebase.md` → Bundled with zero plaintext secrets and complete canonical modules ✅

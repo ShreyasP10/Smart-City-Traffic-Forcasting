@@ -29,4 +29,7 @@ def classify(vol):
 # Test a rush-hour weekday (Monday 8:00 AM)
 sample, _ = featurize_point(dt.datetime(2026, 10, 12, 8, 0), {"weather_main": "Clear", "temp": 290.0, "clouds_all": 40})
 pred_val = float(model.predict(sample)[0])
-print(f"Predicted: {pred_val:.2f} -> {classify(pred_val)}")
+label = classify(pred_val)
+print(f"Predicted: {pred_val:.2f} -> {label}")
+assert label == "Severe", f"Expected Severe, got {label}"
+print("Sanity check passed [OK]")

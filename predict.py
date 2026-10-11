@@ -19,6 +19,7 @@ except ImportError:
     import tomli as tomllib
 
 sys.path.insert(0, os.path.dirname(__file__))
+from city_config import get_city_now
 from traffic_api import fetch_openweather, fetch_tomtom_flow, validate_coordinates
 from schema import safe_load_model, featurize_point, FEATURES
 from pipeline import predict_pipeline, classify
@@ -71,19 +72,32 @@ CACHE_FILE = os.path.join(DATA_DIR, "predict_cache.json")
 def _save_cache(lat: float, lon: float, live: dict) -> None:
     try:
         tmp_file = CACHE_FILE + ".tmp"
+        cache_data = {}
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r") as f:
+                    cache_data = json.load(f)
+            except Exception:
+                pass
+        key = f"{lat:.3f},{lon:.3f}"
+        cache_data[key] = {
+            "lat": lat, "lon": lon, "live": live,
+            "cached_at": datetime.now().isoformat(timespec="seconds")
+        }
         with open(tmp_file, "w") as f:
-            json.dump({"lat": lat, "lon": lon, "live": live,
-                       "cached_at": datetime.now().isoformat(timespec="seconds")}, f, default=str)
+            json.dump(cache_data, f, default=str)
         os.replace(tmp_file, CACHE_FILE)
     except Exception:
         pass
 
 
-def _load_cache() -> dict | None:
+def _load_cache(lat: float, lon: float) -> dict | None:
     try:
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                key = f"{lat:.3f},{lon:.3f}"
+                return data.get(key)
     except Exception:
         pass
     return None
@@ -93,8 +107,26 @@ def fetch_live(lat: float, lon: float) -> dict:
     lat_f, lon_f = validate_coordinates(lat, lon)
     flow = fetch_tomtom_flow(lat_f, lon_f, 50, TT_KEY or None, 0.4)
     w = fetch_openweather(lat_f, lon_f, OW_KEY or None)
+
+    # Cache fallback: check if live fetch succeeded (W6)
+    cached_entry = _load_cache(lat_f, lon_f)
+    if not flow.get("ok") and cached_entry and cached_entry.get("live"):
+        cached_live = cached_entry["live"]
+        flow["current_speed"] = cached_live.get("current_speed", flow["current_speed"])
+        flow["free_flow_speed"] = cached_live.get("free_flow_speed", flow["free_flow_speed"])
+        flow["congestion_ratio"] = cached_live.get("congestion_ratio", flow["congestion_ratio"])
+        flow["source"] = f"cached:tomtom ({cached_entry.get('cached_at', 'earlier')})"
+
+    if not w.get("ok") and cached_entry and cached_entry.get("live"):
+        cached_live = cached_entry["live"]
+        w["temp"] = cached_live.get("temp", w["temp"])
+        w["rain_1h"] = cached_live.get("rain_1h", w.get("rain_1h", 0.0))
+        w["weather_main"] = cached_live.get("weather", w.get("weather_main", "Clear"))
+        w["clouds_all"] = cached_live.get("clouds", w.get("clouds_all", 20))
+        w["source"] = f"cached:weather ({cached_entry.get('cached_at', 'earlier')})"
+
     temp_k = float(w["temp"]) if float(w["temp"]) > 200 else float(w["temp"]) + 273.15
-    return {
+    live_result = {
         "current_speed": flow["current_speed"],
         "free_flow_speed": flow["free_flow_speed"],
         "congestion_ratio": flow["congestion_ratio"],
@@ -105,20 +137,14 @@ def fetch_live(lat: float, lon: float) -> dict:
         "traffic_source": flow["source"],
         "weather_source": w["source"],
     }
+    if flow.get("ok") and w.get("ok"):
+        _save_cache(lat_f, lon_f, live_result)
+    return live_result
 
 
-def predict_now(lat: float, lon: float, offset_min: int = 0) -> dict:
+def predict_now(lat: float, lon: float, offset_min: int = 0, city: str = "Mumbai") -> dict:
     lat_f, lon_f = validate_coordinates(lat, lon)
-    try:
-        live = fetch_live(lat_f, lon_f)
-        if "live:" in str(live.get("traffic_source", "")) or "live:" in str(live.get("weather_source", "")):
-            _save_cache(lat_f, lon_f, live)
-    except Exception as e:
-        cached = _load_cache()
-        if cached and cached.get("live"):
-            live = cached["live"]
-        else:
-            raise
+    live = fetch_live(lat_f, lon_f)
 
     weather_dict = {
         "temp": live["temp"],
@@ -132,16 +158,17 @@ def predict_now(lat: float, lon: float, offset_min: int = 0) -> dict:
         "congestion_ratio": live["congestion_ratio"],
     }
 
-    # Canonical prediction pipeline (identical to app.py)
-    pipe_out = predict_pipeline(datetime.now(), weather_dict, flow_dict, bundle, minutes_ahead=offset_min)
+    # Canonical prediction pipeline with city timezone and holiday context (W8)
+    now_dt = get_city_now(city)
+    pipe_out = predict_pipeline(now_dt, weather_dict, flow_dict, bundle, minutes_ahead=offset_min, city=city)
 
     # Compute SHAP explanation with pure feature attributions and transparent pipeline steps
     why_text = ""
     try:
         from explain_shap import compute_shap_explanation
         shap_info = compute_shap_explanation(
-            datetime.now(), weather_dict, flow_dict, bundle,
-            horizon_min=offset_min, pipeline_pred=pipe_out
+            now_dt, weather_dict, flow_dict, bundle,
+            horizon_min=offset_min, pipeline_pred=pipe_out, city=city
         )
         why_text = shap_info["headline_sentence"]
     except Exception as _e:
@@ -162,7 +189,7 @@ if __name__ == "__main__":
     lat, lon = 19.0653, 72.8686  # Mumbai BKC
     print(f"Keys: TomTom {'found' if TT_KEY else 'MISSING'} | OpenWeather {'found' if OW_KEY else 'MISSING (Open-Meteo fallback)'}")
     for offset in [0, 15, 30, 60]:
-        r = predict_now(lat, lon, offset)
+        r = predict_now(lat, lon, offset, city="Mumbai")
         print(f"T+{offset:02d}min -> {r['congestion_class']:8s} "
               f"(final={r['final_prediction']:.0f}, base={r['raw_prediction']:.0f}) "
               f"| Why: {r['why']}")

@@ -24,8 +24,10 @@ RNG = np.random.default_rng(42)
 
 
 def _hourly_profile(hour: np.ndarray, peak_shift: int = 0) -> np.ndarray:
-    """Two-peak gaussian rush-hour profile, normalised ~0..1."""
-    h = (hour + peak_shift) % 24
+    """Two-peak gaussian rush-hour profile, normalised ~0..1.
+    Positive peak_shift shifts rush-hour peaks later in the day.
+    """
+    h = (hour - peak_shift) % 24
     morning = np.exp(-0.5 * ((h - 8.2) / 1.4) ** 2)
     evening = np.exp(-0.5 * ((h - 17.6) / 1.8) ** 2)
     night = 0.12 + 0.05 * np.cos(2 * np.pi * (h - 3) / 24)
@@ -108,7 +110,7 @@ def load_historical(indian_style: bool = False) -> pd.DataFrame:
         df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
         df["is_holiday"] = ((df["holiday"] != "None") & (df["holiday"] != "")).astype(int)
         return df.sort_values("date_time").reset_index(drop=True)
-    fname = "synthetic_india.csv" if indian_style else "synthetic_us.csv"
+    fname = "synthetic_india_v2.csv" if indian_style else "synthetic_us_v2.csv"
     fpath = os.path.join(DATA_DIR, fname)
     if os.path.exists(fpath):
         df = pd.read_csv(fpath, parse_dates=["date_time"])

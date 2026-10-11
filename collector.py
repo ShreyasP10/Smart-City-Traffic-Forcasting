@@ -114,7 +114,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
     tt, ow = load_keys()
-    print(f"TomTom key: {'found (' + tt[:4] + '…)' if tt else 'MISSING'} | "
+    print(f"TomTom key: {'found' if tt else 'MISSING'} | "
           f"OpenWeather key: {'found' if ow else 'MISSING (Open-Meteo live fallback will be used)'}")
     print(f"CSV: {CSV_PATH} | interval={a.interval}s")
     n = 0

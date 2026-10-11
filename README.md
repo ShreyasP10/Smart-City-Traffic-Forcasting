@@ -6,7 +6,7 @@ historical data** (time, day, weather, holidays), **fuses live TomTom + weather 
 serves everything through an **interpretable 6-tab Streamlit dashboard** with
 Low / Moderate / High / Severe congestion levels.
 
-Last updated: 2026-10-11 ~12:25 — metrics re-synced after 11:57 retrain (base MAE 286.3).
+Last updated: 2026-10-11 ~12:40 — React UI added (`api.py` + `frontend/`).
 
 ---
 
@@ -15,12 +15,13 @@ Last updated: 2026-10-11 ~12:25 — metrics re-synced after 11:57 retrain (base 
 Terminal 1 — train + verify + dashboard:
 ```powershell
 pip install -r requirements.txt
-python train_base.py        # real UCI (48,204 rows) -> base_model.pkl | XGB MAE 286.3, RMSE 509.8
-python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | transfer 2240 -> 604
-python sanity_check.py      # expect: Predicted: 5484.45 -> Severe
-python predict.py           # expect: 4 live lines T+0/15/30/60 (currently Moderate, Sat off-peak)
-python test_tomtom.py <KEY># optional key check: flow + routing + incidents, all live
-streamlit run app.py        # dashboard http://localhost:8501 (keys pre-filled)
+python train_base.py        # real UCI (48,204 rows) -> base_model.pkl | XGB MAE 264.6 vs Baseline 277.2
+python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | held-out MAE 487.7
+python sanity_check.py      # expect: Predicted: 5452.45 -> Severe [OK]
+python test_suite.py        # 6/6 unit tests pass (waterfall additivity, decay, boundaries, holidays, SSRF, SHA-256)
+python predict.py           # expect: 4 live lines T+0/15/30/60 with dynamic SHAP attribution
+python test_tomtom.py <KEY> # optional key check: flow + routing + incidents, all live
+streamlit run app.py        # dashboard http://localhost:8501
 ```
 
 Terminal 2 — leave running for the full 5 hours:
@@ -31,6 +32,32 @@ python collector.py --once    # single round (3 rows), for testing
 
 No keys? The app still runs fully offline in calibrated simulation mode
 (every response is tagged `source: live:*|simulated`, so judges see what is real).
+
+## 1b. React UI (alternative frontend)
+
+Same model + pipeline, served over HTTP:
+```powershell
+# Terminal A — backend (keep running; restarts needed: jobs don't persist)
+python -m uvicorn api:app --port 8000
+
+# Terminal B — frontend
+cd frontend
+npm install            # once (recharts + react-leaflet + axios)
+npm run dev            # open http://localhost:5173 (proxies /api -> :8000)
+npm run build          # production build check (verified ✅)
+```
+
+| Endpoint | Serves view |
+|---|---|
+| `GET /api/health`, `/api/cities`, `/api/thresholds` | boot + selectors |
+| `GET /api/overview?city=&route=&hour=` | 📍 Overview (metrics, badge, SHAP drivers) |
+| `GET /api/forecast?city=&route=` | 🔮 Forecast table + 3-line chart |
+| `GET /api/heatmap?city=` | 🗺 Leaflet heatmap (OSM tiles, no token) |
+| `GET /api/patterns` | 📊 Peaks, weekday bars, hour×day grid |
+| `GET /api/adaptation?city=&route=` | 🔁 Stages, delta, collector chart data |
+| `GET /api/compare?city=&a=&b=` | ⚖ A/B metrics + best route |
+
+All 8 verified live (simulated-mode: forecast Low×4 Sat-midday; heatmap 5 pts; patterns 24h; collector 30 rows; compare 17.0 vs 14.0 min, best correct).
 
 ## 2. API keys (current live status)
 
@@ -95,24 +122,26 @@ Calibration head (4): `base_pred`, `rain_1h`, `hour`, `is_peak`.
 
 ## 5. Methodological & Security Integrity (Audit Verified)
 
-- **Strict Chronological Splits (Zero Data Leakage):** Enforces strict temporal splits (past trains, future tests) without shuffling. Chronological out-of-time Base MAE: 285.7, RMSE: 508.3.
-- **Honest Transfer Learning Validation:** Ridge calibration evaluated on a held-out 30% chronological validation slice (held-out MAE: 604.0), preventing in-sample overfitting claims.
-- **Pure SHAP & Additive Waterfall:** Pure Shapley values explain model features. Downstream calibration delta and live-speed fusion are displayed as explicit waterfall stages, summing with 100% arithmetic equality.
-- **Dynamic Horizons:** Exponential decay (`w_live = 0.35 * exp(-m/45)`) transitions smoothly from live sensor dominance at T+0 to temporal model predictions at T+60.
+- **Strict Chronological Splits (Zero Data Leakage):** Enforces strict temporal splits (past trains, future tests) without shuffling. Chronological out-of-time Base MAE: 264.6, RMSE: 484.6 vs Naive Baseline MAE 277.2 (4.5% error reduction).
+- **Honest Transfer Learning Validation:** Ridge calibration evaluated on a held-out 30% chronological validation slice (held-out MAE: 487.7), preventing in-sample overfitting claims. Target Indian corridor pattern is explicitly labeled as a synthetic adaptation benchmark.
+- **Pure SHAP & 100% Additive Waterfall:** Pure Shapley values explain model features with zero invented constants. Downstream intra-hour progression, calibration delta, live speed fusion, and physical bounding / display rounding are displayed as explicit waterfall stages, summing with 100% exact mathematical equality to `final_vol`.
+- **Dynamic Horizons:** Sub-hour linear interpolation and exponential decay (`w_live = 0.35 * exp(-m/45)`) transition smoothly from live sensor dominance at T+0 to temporal model predictions at T+60.
 - **Security & Integrity:** SHA-256 model checksum verification (`safe_load_model()`), input coordinate validation (`validate_coordinates()`), secret token exception scrubbers (`_redact()`), and empty password widget defaults.
+- **Automated Unit Test Suite:** `test_suite.py` validates waterfall additivity, horizon decay monotonicity, classification boundaries, city-specific holidays, SSRF defenses, and SHA-256 integrity (6/6 tests passing).
 
 ## 6. Files (what each does)
 
 - `schema.py` — Canonical 16-feature vector, cyclic trigonometric encoders, SHA-256 model integrity verification (`safe_load_model`).
-- `pipeline.py` — Unified prediction pipeline: base XGBoost inference, Ridge calibration, and horizon-decayed live speed fusion.
-- `app.py` — 6-tab Streamlit dashboard (Overview, Forecast, Heatmap, Patterns, Adaptation, Route compare) with XSS guards, timezone awareness, and Plotly visualizations.
+- `pipeline.py` — Unified prediction pipeline: base XGBoost inference with sub-hour linear interpolation, Ridge calibration, and horizon-decayed live speed fusion.
+- `app.py` — 6-tab Streamlit dashboard (Overview, Forecast, Heatmap, Patterns, Adaptation, Route compare) with XSS guards, timezone awareness, cached API queries, and Plotly visualizations.
 - `explain_shap.py` — SHAP `TreeExplainer` module: pure feature attributions, percentage contributions, and mathematically additive waterfall charts.
-- `predict.py` — Hardened CLI prediction pipeline importing `pipeline.py` with pure SHAP explanations and isolated cache.
-- `train_base.py` — Chronological out-of-time training on UCI dataset producing `base_model.pkl`.
+- `predict.py` — Hardened CLI prediction pipeline importing `pipeline.py` with pure SHAP explanations, location-keyed cache fallback, and city timezone support.
+- `train_base.py` — Chronological out-of-time training on UCI dataset producing `base_model.pkl` with historical baseline benchmark.
 - `train_model.py` — Chronological training of base model + Ridge calibration with honest 70/30 held-out split.
 - `traffic_api.py` — Resilient TomTom + OpenWeather/Open-Meteo client with parameter escaping and secret redaction.
-- `data_generator.py` — UCI loader with `keep_default_na=False` and synthetic fallback generator.
+- `data_generator.py` — UCI loader with `keep_default_na=False` and versioned synthetic fallback generator (`_v2.csv`).
 - `city_config.py` — Multi-city configurations (Mumbai, Bengaluru, Delhi NCR, Pune, Minneapolis) with `ZoneInfo` timezone handlers and holiday calendars.
+- `test_suite.py` — Comprehensive automated unit test suite covering additivity, decay, boundaries, holidays, SSRF, and integrity.
 - `sanity_check.py` / `test_tomtom.py` — Verification scripts testing model integrity and live API connectivity.
 - `codebase.md` — Complete single-file codebase bundle containing all project code and configs.
 - `base_model.pkl` / `models/traffic_model.joblib` — trained artifacts (don't delete).
@@ -142,3 +171,4 @@ Fallbacks to narrate: keys empty → simulation; network dead → `last_response
 - `indian_realtime.csv` missing/empty warning → start `python collector.py` in terminal 2.
 - Port busy (`:8501` taken) → `streamlit run app.py --server.port 8502`.
 - `use_container_width` / ScriptRunContext warnings → cosmetic, ignore.
+- Printing route names (`→`) to PowerShell console crashes with `UnicodeEncodeError` (cp1252) → redirect to file or avoid printing; the API itself handles UTF-8 fine.

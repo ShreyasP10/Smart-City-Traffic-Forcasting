@@ -21,8 +21,8 @@ FEATURES: list[str] = [
 ]
 
 WEATHER_CODE: dict[str, int] = {
-    "Clear": 0, "Clouds": 1, "Mist": 2, "Fog": 2, "Drizzle": 3,
-    "Rain": 4, "Snow": 5, "Thunderstorm": 6, "Haze": 2
+    "Clear": 0, "Clouds": 1, "Mist": 2, "Fog": 2, "Haze": 2, "Smoke": 2, "Sand": 2, "Dust": 2, "Ash": 2,
+    "Drizzle": 3, "Rain": 4, "Squall": 4, "Snow": 5, "Thunderstorm": 6
 }
 
 CHECKSUMS_FILE = os.path.join(os.path.dirname(__file__), "models", "checksums.json")
@@ -62,8 +62,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def featurize_point(at: dt.datetime, weather: dict) -> tuple[np.ndarray, dict]:
-    """Featurizes a single point in time and weather into canonical feature vector."""
+def featurize_point(at: dt.datetime, weather: dict, city: str = "Mumbai") -> tuple[np.ndarray, dict]:
+    """Featurizes a single point in time and weather into canonical feature vector with city-specific holidays."""
+    from city_config import is_holiday
     wc = WEATHER_CODE.get(weather.get("weather_main", "Clear"), 1)
     hour = at.hour
     dow = at.weekday()
@@ -73,7 +74,9 @@ def featurize_point(at: dt.datetime, weather: dict) -> tuple[np.ndarray, dict]:
         "day_of_week": dow,
         "month": at.month,
         "is_weekend": int(dow >= 5),
-        "is_holiday": int((at.month, at.day) in {(1, 26), (8, 15), (10, 2), (12, 25), (5, 1), (1, 1), (7, 4)}),
+        # Demo override convention: weather dicts may carry _holiday_override=True
+        # (set by api.py demo controls). Otherwise city-calendar lookup applies.
+        "is_holiday": 1 if weather.get("_holiday_override") else int(is_holiday(at, city)),
         "temp": float(weather.get("temp", 300.0)),
         "rain_1h": float(weather.get("rain_1h", 0.0)),
         "snow_1h": 0.0,
@@ -100,13 +103,14 @@ def compute_sha256(filepath: str) -> str:
 
 
 def safe_load_model(path: str, expected_sha256: str | None = None) -> dict:
-    """Loads a joblib model bundle safely with optional SHA-256 integrity verification."""
+    """Loads a joblib model bundle and detects corrupted, modified, or swapped model files via SHA-256 verification."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Model file not found: {path}")
 
-    if expected_sha256:
+    target_hash = os.environ.get("MODEL_SHA256") or expected_sha256
+    if target_hash:
         actual_sha = compute_sha256(path)
-        if not hmac.compare_digest(actual_sha, expected_sha256):
-            raise ValueError(f"Integrity check failed for model file: {path} (hash mismatch)")
+        if not hmac.compare_digest(actual_sha, target_hash):
+            raise ValueError(f"Integrity check failed for model file: {path} (expected {target_hash[:12]}..., got {actual_sha[:12]}...)")
 
     return joblib.load(path)

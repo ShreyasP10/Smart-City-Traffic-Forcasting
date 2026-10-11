@@ -63,10 +63,8 @@ def _open_meteo(lat: float, lon: float) -> dict | None:
             wmain = "Rain"
         elif code in (45, 48):
             wmain = "Fog"
-        elif code >= 3:
-            wmain = "Clouds"
-        elif code == 2:
-            wmain = "Mist"
+        elif code in (1, 2, 3) or code > 3:
+            wmain = "Clouds" if code >= 2 else "Clear"
         else:
             wmain = "Clear"
         return {
