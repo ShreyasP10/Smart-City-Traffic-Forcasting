@@ -1,5 +1,35 @@
 # Complete Codebase — Smart City Traffic Forecasting & Adaptation
 
+.gitignore
+```
+# Secrets and credentials
+.streamlit/secrets.toml
+.env
+*.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary & cache files
+.pytest_cache/
+last_response.json
+data/*_cache.json
+*.tmp
+data/indian_realtime.csv
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Helper scripts
+generate_codebase.py
+```
+
+---
+
 requirements.txt
 ```text
 # Requirements for Smart City Traffic Forecasting prototype.
@@ -12,6 +42,7 @@ xgboost>=2.0
 plotly>=5.18
 requests>=2.31
 joblib>=1.3
+shap>=0.44
 ```
 
 ---
@@ -2499,6 +2530,10 @@ Workspace: `Smart City Traffic Forcasting/`
 ## 11:20 — README detailed rewrite
 - Expanded from 87-line brief to full detailed README (8 sections): two-terminal quickstart, live-key table, 20-row PS×brownie mapping, architecture diagram + feature lists, honest audit, per-file guide, 7-step demo tour, troubleshooting.
 
+## 12:25 — Metrics re-sync (11:57 retrain changed the numbers)
+- Other session's retrain moved base MAE 252.5→286.3, RMSE 436.9→509.8, thresholds → [1186, 3378, 4939], transfer 2220→595 becomes 2240→604 (still 73% drop), sanity 5649.82→5484.45 (still Severe ✅).
+- Updated README quickstart/table/demo-tour numbers. Older timeline/issues entries keep original figures (accurate at their time).
+
 ## 12:15 — Crash triage from your run log (3 fixes, all verified)
 - `requirements.txt` had `"""docstring"""` header lines → pip `Invalid requirement`. Rewrote as pure `#` comments + pins; dropped `shap` (optional fallback exists, heavy Windows build). `pip install -r` now all-satisfied.
 - `app.py:77` `NameError: featurize_point` (other session's import gap) → added to the `from schema import` line.
@@ -2559,7 +2594,7 @@ historical data** (time, day, weather, holidays), **fuses live TomTom + weather 
 serves everything through an **interpretable 6-tab Streamlit dashboard** with
 Low / Moderate / High / Severe congestion levels.
 
-Last updated: 2026-10-11 ~11:20 — detailed rewrite. Collector at 12 rows / 3 locs and growing.
+Last updated: 2026-10-11 ~12:25 — metrics re-synced after 11:57 retrain (base MAE 286.3).
 
 ---
 
@@ -2568,9 +2603,9 @@ Last updated: 2026-10-11 ~11:20 — detailed rewrite. Collector at 12 rows / 3 l
 Terminal 1 — train + verify + dashboard:
 ```powershell
 pip install -r requirements.txt
-python train_base.py        # real UCI (48,204 rows) -> base_model.pkl | XGB MAE 252.5, RMSE 436.9
-python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | transfer 2220 -> 595
-python sanity_check.py      # expect: Predicted: 5649.82 -> Severe
+python train_base.py        # real UCI (48,204 rows) -> base_model.pkl | XGB MAE 286.3, RMSE 509.8
+python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | transfer 2240 -> 604
+python sanity_check.py      # expect: Predicted: 5484.45 -> Severe
 python predict.py           # expect: 4 live lines T+0/15/30/60 (currently Moderate, Sat off-peak)
 python test_tomtom.py <KEY># optional key check: flow + routing + incidents, all live
 streamlit run app.py        # dashboard http://localhost:8501 (keys pre-filled)
@@ -2605,13 +2640,13 @@ No keys? The app still runs fully offline in calibrated simulation mode
 
 | # | PS requirement | Implementation | Evidence |
 |---|---|---|---|
-| 1 | Pattern learning (time/day/weather/holidays/volume) | `train_base.py`: 10 features (hour, dow, month, weekend, holiday, temp, rain, snow, clouds, weather_code) on real UCI | MAE 252.5 (~8% of mean 3259); Patterns tab curves |
+| 1 | Pattern learning (time/day/weather/holidays/volume) | `train_base.py` + canonical `schema.py` features on real UCI | MAE 286.3 (~9% of mean 3259); Patterns tab curves |
 | 2 | Forecast current + near-future (15/30/60) | `predict.py:predict_now(lat,lon,offset)` + Forecast tab table + line | 4 live lines on every run |
 | 3 | Real-time traffic API in the pipeline | `traffic_api.fetch_tomtom_flow()` (flowSegmentData) + Routing for trip times; fusion `0.65*adapted + 0.35*live-implied` | `live:*` badges; contribution note in Overview |
-| 4 | Context adaptation to Indian city | Ridge stacking head `[base_pred, rain, hour, is_peak]` → India scale; Adaptation tab base-vs-adapted + 🇮🇳 live-CSV section | 2220 → 595 MAE (73% drop) |
+| 4 | Context adaptation to Indian city | Ridge stacking head `[base_pred, rain, hour, is_peak]` → India scale (235 train / 101 val); Adaptation tab base-vs-adapted + 🇮🇳 live-CSV section | 2240 → 604 MAE (73% drop) |
 | 5 | Interpretability | `explain_shap.py`: SHAP TreeExplainer, % contributions (e.g. "Heavy rain 40%, Rush hour 35%"), Plotly Waterfall + Factor Influence + Donut charts in Overview & Forecast | Overview + Forecast "Why this prediction?" |
 | 6 | Interactive dashboard | `app.py`: 6 tabs, city/route/custom-point + time + horizon controls | serves :8501/:8502 verified |
-| 7 | Classification Low/Moderate/High/Severe | Data-driven quartiles [1192, 3371, 4932] from training volumes | badges + map colors everywhere |
+| 7 | Classification Low/Moderate/High/Severe | Data-driven quartiles [1186, 3378, 4939] from training volumes | badges + map colors everywhere |
 | Brownie | Traffic heatmap | Heatmap tab: `px.scatter_map` (OSM, no token), size ∝ volume | green→red corridors |
 | Brownie | Short-term forecasting visualised | Forecast tab line (final/adapted/base) + horizon slider + T+horizon badge | varies at hour boundaries |
 | Brownie | Cross-context prediction | Adaptation tab side-by-side base/adapted/final + delta | e.g. +delta veh/hr shown live |
@@ -2682,7 +2717,7 @@ Calibration head (4): `base_pred`, `rain_1h`, `hour`, `is_peak`.
 2. **Forecast:** 0/15/30/60 table + line; move the horizon slider, watch the badge follow.
 3. **Heatmap:** all city corridors green→red, size ∝ volume (OSM tiles, no token).
 4. **Patterns:** double rush-hour peaks, weekday/weekend gap, hour×day heatmap, weather effect.
-5. **Adaptation:** 2220→595 transfer numbers, base/adapted/final table, 🇮🇳 collector count + chart.
+5. **Adaptation:** 2240→604 transfer numbers, base/adapted/final table, 🇮🇳 collector count + chart.
 6. **Route compare:** A vs B → ✅ recommendation with trip minutes.
 7. **Alert:** set hour 18:00 → Severe banner with causes + alternate-route advice.
 Fallbacks to narrate: keys empty → simulation; network dead → `last_response.json` cache banner.
