@@ -1,0 +1,13 @@
+{
+  "base_mae": 253.59519958496094,
+  "base_rmse": 438.4344484925882,
+  "calib_mae_adapted": 594.6318400275517,
+  "calib_mae_unadapted": 2220.17431640625,
+  "n_us": 48204,
+  "n_india_calib": 336,
+  "thresholds": [
+    1191.5,
+    3371.0,
+    4932.0
+  ]
+}

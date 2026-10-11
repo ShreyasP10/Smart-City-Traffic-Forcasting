@@ -1,0 +1,21 @@
+# Secrets and credentials
+.streamlit/secrets.toml
+.env
+*.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary & cache files
+.pytest_cache/
+last_response.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Helper scripts
+generate_codebase.py
