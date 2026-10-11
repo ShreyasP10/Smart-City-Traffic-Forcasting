@@ -6,7 +6,7 @@ historical data** (time, day, weather, holidays), **fuses live TomTom + weather 
 serves everything through an **interpretable 6-tab Streamlit dashboard** with
 Low / Moderate / High / Severe congestion levels.
 
-Last updated: 2026-10-11 ~12:40 — React UI added (`api.py` + `frontend/`).
+Last updated: 2026-10-11 ~13:20 — TrafficSense port complete (10 React views, 14 endpoints).
 
 ---
 
@@ -56,6 +56,30 @@ npm run build          # production build check (verified ✅)
 | `GET /api/patterns` | 📊 Peaks, weekday bars, hour×day grid |
 | `GET /api/adaptation?city=&route=` | 🔁 Stages, delta, collector chart data |
 | `GET /api/compare?city=&a=&b=` | ⚖ A/B metrics + best route |
+| `GET /api/overview?…,dow=&hour=` / forecast | Any weekday (0=Mon..6=Sun) + hour — e.g. Monday congestion per route |
+| `GET /api/whatif?…` | 🧪 Simulator + staged base→adapted + prescription |
+| `GET /api/diagnostics` | 🔬 Backend, MAE/RMSE, importances, Ridge coef, thresholds |
+| `GET /api/insight?city=&route=` | ✨ Deterministic advisory text (template; no key needed) |
+| `GET /api/geocode?q=` | Nominatim proxy → any global city → custom-point forecast |
+| `POST /api/keys` `{tomtom, openweather}` | Runtime keys (memory only) → flips sim → live |
+| `GET /api/tiles` | TomTom raster tile URL template (when key set) |
+| `GET /api/corridor?olat=&olon=&dlat=&dlon=` | 🛣 Free routing (TomTom live or haversine) + mid-corridor prediction + advice |
+| `GET /api/grid?city=&horizon=` | 9-point telemetry grid for map overlay |
+| `GET /api/model` | Active model backend/metrics/custom flag |
+| `POST /api/retrain` (CSV + trees/depth/lr) | 🧠 In-app retrain → swaps live bundle |
+
+React views (11 tabs): Overview (gauge + count-up + verdict + fusion card + SHAP + insight + legacy-vs-upgraded + event banner),
+**Route planner** (free source/destination via search or map-click, swap, polyline, distance/time/delay + advice),
+Forecast, Heatmap (corridors / 9-pt grid toggle, horizon pills, legend, rich popups, PNG export, raster toggle),
+Patterns, **Simulator** (5 scenarios, sliders, prescription, attribution waterfall), **Diagnostics** (architecture map, metrics,
+importances, Ridge equation, benchmark), Adaptation, **Calendar** (8 preloaded events,
+month grid, schedule, 24h model-backed inspector, what-if sliders, add-event modal),
+**Alerts** (High/Severe threshold, feed, mark-read/clear), Compare. Header: **city chips**
+(one-tap) + corridor select + hour override, rain/holiday demo toggles, geocode search → custom
+point, 60s auto-refresh countdown, theme toggle, Settings dialog (keys + CSV retrain + health).
+Severe toast + footer model bar. Free-text City/Corridor fields (suggestions + geocode, zero
+forced predefined picks), weekday pills (Mon–Sun per-route lookup), segmented rain
+(Dry/Drizzle/Heavy mm) + Holiday toggle. All views wrapped in error boundaries (blank-tab proof).
 
 All 8 verified live (simulated-mode: forecast Low×4 Sat-midday; heatmap 5 pts; patterns 24h; collector 30 rows; compare 17.0 vs 14.0 min, best correct).
 

@@ -153,6 +153,22 @@ Workspace: `Smart City Traffic Forcasting/`
 - Note: PS background jobs don't survive between commands — backend must run in a real
   terminal (`uvicorn api:app --port 8000`), not a job.
 
+## 13:00–13:20 — TrafficSense port (maps/charts/detail + every feature)
+- Inventoried trafficsense (~400KB TS) via 3 parallel agents: shell/state, ML, map/charts/calendar.
+- Backend (+6 endpoints): `whatif` (4753 High rush+rain ✅), `diagnostics` (XGBRegressor, top=hour_cos),
+  `insight` template, `geocode` proxy (Mumbai ✅), runtime `POST /keys`, `tiles` URL;
+  rain/holiday demo overrides + lat/lon custom points on overview/forecast;
+  holiday via `_holiday_override` dict convention (no signature changes).
+- Frontend (10 tabs): horizon-pill map + legend + rich popups + PNG export + raster toggle;
+  gauge/count-up/fusion/verdict/insight on Overview; Simulator (5 scenarios, sliders,
+  prescription); Diagnostics (metrics, importances, Ridge eq, benchmark); Alerts
+  (threshold switcher, feed, read/clear); Calendar (8 events, grid, schedule, 24h
+  model-backed inspector, attendance/rain/police sliders, add-event modal + localStorage);
+  Settings dialog; geocode search → custom point; 60s auto-refresh; rain/holiday toggles.
+- Verified: `npm run build` ✅ 1.5s; overrides (rain 3.5 + holiday flag ✅);
+  whatif rush+rain → High + shift advice ✅. Skipped: in-browser GBM retrain (XGB backend
+  instead), real Gemini calls (template insight), per-corridor alert dedup (global feed).
+
 ## 12:15 — Crash triage from your run log (3 fixes, all verified)
 - `requirements.txt` had `"""docstring"""` header lines → pip `Invalid requirement`. Rewrote as pure `#` comments + pins; dropped `shap` (optional fallback exists, heavy Windows build). `pip install -r` now all-satisfied.
 - `app.py:77` `NameError: featurize_point` (other session's import gap) → added to the `from schema import` line.
@@ -213,4 +229,68 @@ Workspace: `Smart City Traffic Forcasting/`
   - Removed key prefix characters from `collector.py` terminal prints.
   - Added naive historical (Hour × Day) baseline benchmark in `train_base.py` (XGBoost achieves 4.5% error reduction over baseline).
   - Created automated unit test suite `test_suite.py` with 6 comprehensive test cases (all 6 pass ✅).
+
+## 13:25 — Glassmorphism UI rewrite (user: "ui is shitty")
+- Rewrote `frontend/src/index.css`: frosted-glass cards (blur 16px, translucent borders),
+  ambient gradient blobs, pill tab bar, glowing badges/legend, glass modal + calendar —
+  same class names, zero JSX changes. `npm run build` ✅ 900ms.
+
+## 13:45–14:00 — Free corridor planner + city simplify + full parity
+- Backend: `GET /corridor` (TomTom routing or haversine + midpoint prediction + advice ✅),
+  `GET /grid` (9-pt telemetry ✅), `GET /model`, `POST /retrain` (UCI CSV → XGB + calibration
+  refit → in-memory swap ✅ tested, MAE 564 on 3k-row/20-tree trial); fixed dup `/tiles` route
+  and `UploadFile` multipart signature along the way.
+- Frontend: 🛣 Route tab (source/dest search + click-map-to-set + swap + polyline + cards);
+  city dropdown → one-tap chips; Overview legacy-vs-upgraded card + next-event banner;
+  map corridors/grid toggle; severe toast; footer model bar; Settings CSV retrain UI.
+- Shared `data/events.js` (Calendar refactored onto it). Fixed own dup-state build break.
+  `npm run build` ✅. Skipped only: real Gemini calls, per-corridor alert dedup.
+
+## 14:20–14:30 — Google-style autocomplete everywhere
+- New shared `Autocomplete.jsx`: type-ahead list, match **highlight**, ArrowUp/Down +
+  Enter + Escape keyboard nav, mouse hover pick, popular defaults on focus, no-result
+  collapse. CityField + CorridorField rewritten on it; Route-planner search boxes now
+  suggest ⭐ popular places first, then live geocode. Fixed own dup-import break.
+- CSS: keyboard-focus row, `<mark>` highlight (both themes). `npm run build` ✅.
+
+## 14:00–14:20 — Free-text everywhere + weekday lookup + analysis charts + hardening
+- Backend: `/patterns` += weekday/weekend diurnal series; `/whatif` += staged
+  base→adapted + calibration_delta (3682→2146 ✅); `/overview` + `/forecast` += `dow`
+  param (dow=0 → Mon 2026-10-12 ✅); `rain_mm` float override.
+- Frontend: City + Corridor free-text fields (suggestions + geocode, Enter-to-pick);
+  weekday pills Mon–Sun; segmented rain (Dry/Drizzle/Heavy mm) + Holiday toggle card;
+  Route tab + all views inside ErrorBoundary (blank tab now shows the error + retry);
+  map min-height wrapper; Compare rewritten free (two CorridorFields, both directions).
+- Patterns += rainfall-vs-congestion sweep, holiday-vs-workday grouped bars,
+  clear-vs-harsh weather bars, weekday/weekend diurnal overlay.
+- Diagnostics += 4-stage architecture inspector; Simulator += attribution waterfall.
+- Root-caused earlier test flakiness: stale PID 20360 squatting :8000 with old code —
+  kill squatters (`netstat -ano | :8000`) before trusting endpoint tests.
+- `npm run build` ✅.
+
+## 13:30 — Layout polish pass (user: "buttons charts text div position")
+- Sticky glass control toolbar (top-0, blur 18px) so city/route/filters stay reachable.
+- Global recharts theme in CSS: dim-blue ticks, dark glass tooltips, dim grid/legend —
+  fixes all 10 views at once (was near-unreadable defaults on dark bg).
+- Dark Leaflet tooltips/popups/controls to match theme; layout rhythm (fade-in,
+  spacing, responsive ≤720px grids). `npm run build` ✅ 1s.
+
+## 13:35 — Light theme (user: "light theme + proper website style")
+- Rewrote `index.css` for light: airy gradient bg, white-glass cards, dark slate text,
+  light pills/tabs (dark active), light tooltips/popups/charts, CartoDB Voyager map base.
+- Gauge needle recolored dark for white cards. `npm run build` ✅.
+
+## 13:40 — Typography (user: "font text")
+- Real fonts via Google Fonts: **Sora** (display: title, metric numbers) + **Inter** (body/UI),
+  system-ui fallback offline; proper `<title>` + meta description.
+- Tabular numerals on metrics/tables/calendar, antialiased body, refined scale/spacing.
+- `npm run build` ✅.
+
+## 13:45 — Theme toggle + Overview type + gauge rebuild
+- Finished toggle (was half-done): 🌙/☀️ button in toolbar, `data-theme` on `<html>`,
+  persisted to localStorage, full dark override block, dark-matter tiles via `dark` prop.
+  Added missing base rules (gauge classes, heat grid) found absent in light CSS.
+- Value/unit fix: `.bignum` 32px display number + small muted `.unit` (was same-size).
+- Gauge rebuilt: 4-segment meter (green/yellow/orange/red), tick marks, tailed needle,
+  theme-aware track/ticks via classes. `npm run build` ✅.
 

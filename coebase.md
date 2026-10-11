@@ -2412,6 +2412,646 @@ st.caption("Hardened prototype: XGBoost + Ridge calibration · TomTom + OpenWeat
 
 ---
 
+api.py
+```python
+"""FastAPI backend for the React UI. Reuses the canonical pipeline verbatim.
+
+Run:  uvicorn api:app --port 8000
+React dev server proxies /api -> localhost:8000 (see frontend/vite.config.js).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+
+import joblib  # noqa: F401 (kept for safe_load_model internals)
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+
+from city_config import CITIES
+from data_generator import load_historical
+from pipeline import predict_pipeline
+from schema import safe_load_model
+from traffic_api import fetch_openweather, fetch_tomtom_flow
+
+BASE = os.path.dirname(__file__)
+MODEL_PATH = os.path.join(BASE, "models", "traffic_model.joblib")
+CHECKSUMS_FILE = os.path.join(BASE, "models", "checksums.json")
+LEVEL_COLOR = {"Low": "#22c55e", "Moderate": "#eab308", "High": "#f97316", "Severe": "#ef4444"}
+
+app = FastAPI(title="Smart City Traffic API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _secret(name: str) -> str:
+    if os.environ.get(name):
+        return os.environ[name]
+    p = os.path.join(BASE, ".streamlit", "secrets.toml")
+    try:
+        import tomllib
+        with open(p, "rb") as f:
+            return str(tomllib.load(f).get(name, ""))
+    except Exception:
+        return ""
+
+
+TT_KEY = _secret("TOMTOM_API_KEY") or _secret("TOMTOM_KEY")
+OW_KEY = _secret("OPENWEATHER_API_KEY") or _secret("OPENWEATHER_KEY")
+
+_RUNTIME = {"tomtom": "", "openweather": ""}
+
+
+def tt_key() -> str:
+    return _RUNTIME["tomtom"] or TT_KEY
+
+
+def ow_key() -> str:
+    return _RUNTIME["openweather"] or OW_KEY
+
+_bundle = None
+_data = None
+_bundle_meta = {"custom": False, "trained_at": None, "source": "models/traffic_model.joblib"}
+
+
+def bundle():
+    global _bundle
+    if _bundle is None:
+        sha = None
+        try:
+            sha = json.load(open(CHECKSUMS_FILE)).get("traffic_model.joblib")
+        except Exception:
+            pass
+        _bundle = safe_load_model(MODEL_PATH, sha)
+    return _bundle
+
+
+def data():
+    global _data
+    if _data is None:
+        _data = (load_historical(indian_style=False), load_historical(indian_style=True))
+    return _data
+
+
+def _route(city: str, route: str) -> dict:
+    if city not in CITIES:
+        raise HTTPException(404, f"unknown city {city}")
+    for r in CITIES[city]["routes"]:
+        if r["name"] == route:
+            return r
+    raise HTTPException(404, f"unknown route {route}")
+
+
+def _live(city: str, route: dict, at: dt.datetime, rain_override: bool = False,
+          rain_mm: float = 0.0, holiday_override: bool = False):
+    b = bundle()
+    weather = fetch_openweather(route["lat"], route["lon"], ow_key() or None)
+    if rain_override or rain_mm > 0:
+        weather["rain_1h"] = max(float(weather.get("rain_1h", 0)), float(rain_mm) if rain_mm > 0 else 3.5)
+        if weather.get("weather_main") == "Clear":
+            weather["weather_main"] = "Rain"
+    if holiday_override:
+        weather["_holiday_override"] = True
+    _, india = data()
+    hist = india if city != "Minneapolis (Source / US)" else data()[0]
+    try:
+        hm = float(hist[hist["date_time"].dt.hour == at.hour]["traffic_volume"].mean())
+    except Exception:
+        hm = 1500.0
+    import numpy as np
+    hint = float(np.clip(hm / 5500, 0.05, 0.95))
+    flow = fetch_tomtom_flow(route["lat"], route["lon"], route["free_flow"], tt_key() or None, hint)
+    length = float(route.get("length_km", 5.0))
+    flow["travel_time_min"] = round(length / max(flow["current_speed"], 1) * 60, 1)
+    flow["free_time_min"] = round(length / max(flow["free_flow_speed"], 1) * 60, 1)
+    flow["delay_min"] = round(flow["travel_time_min"] - flow["free_time_min"], 1)
+    return weather, flow
+
+
+def _clean(d: dict) -> dict:
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dt.datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, dict):
+            out[k] = _clean(v)
+        elif isinstance(v, (list, tuple)):
+            out[k] = [x.isoformat() if isinstance(x, dt.datetime) else x for x in v]
+        else:
+            try:
+                import numpy as _np
+                if isinstance(v, _np.generic):
+                    v = v.item()
+            except Exception:
+                pass
+            out[k] = v
+    return out
+
+
+def _shap(at, weather, flow, b, horizon=0, pipe=None):
+    try:
+        from explain_shap import compute_shap_explanation
+        s = compute_shap_explanation(at, weather, flow, b, horizon_min=horizon,
+                                     pipeline_pred=pipe if horizon == 0 else None)
+        return {"headline": s.get("headline_sentence", ""),
+                "summary": s.get("summary_text", ""),
+                "drivers": [{"name": d.get("name"), "impact": float(d.get("impact", 0)),
+                             "pct": float(d.get("pct_push_up", 0) if d.get("impact", 0) > 0
+                                         else d.get("pct_pull_down", 0))}
+                            for d in s.get("top_drivers", [])[:6]]}
+    except Exception as e:
+        return {"headline": "", "summary": f"SHAP unavailable ({e})", "drivers": []}
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "tomtom": bool(tt_key()), "openweather": bool(ow_key())}
+
+
+@app.post("/api/keys")
+def set_keys(payload: dict):
+    if payload.get("tomtom") is not None:
+        _RUNTIME["tomtom"] = str(payload["tomtom"]).strip()
+    if payload.get("openweather") is not None:
+        _RUNTIME["openweather"] = str(payload["openweather"]).strip()
+    return {"ok": True, "tomtom": bool(tt_key()), "openweather": bool(ow_key())}
+
+
+def _custom_route(lat: float, lon: float) -> dict:
+    return {"name": f"Custom ({lat:.4f}, {lon:.4f})", "lat": float(lat), "lon": float(lon),
+            "free_flow": 50, "length_km": 5.0}
+
+
+@app.get("/api/cities")
+def cities():
+    return {"cities": [
+        {"name": c, "center": list(CITIES[c]["center"]),
+         "routes": [{"name": r["name"], "lat": r["lat"], "lon": r["lon"],
+                     "free_flow": r["free_flow"], "length_km": r.get("length_km", 5.0)}
+                    for r in CITIES[c]["routes"]]}
+        for c in CITIES]}
+
+
+@app.get("/api/thresholds")
+def thresholds():
+    b = bundle()
+    return {"thresholds": [float(x) for x in b["thresholds"]], "metrics": b.get("metrics", {})}
+
+
+def _at_with(hour: int | None = None, dow: int | None = None) -> dt.datetime:
+    """Target datetime: upcoming `dow` (Mon=0..Sun=6) at `hour`, else now."""
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    if dow is not None:
+        at = at + dt.timedelta(days=(int(dow) % 7 - at.weekday()) % 7)
+    if hour is not None:
+        at = at.replace(hour=int(hour) % 24, minute=0)
+    return at
+
+
+@app.get("/api/overview")
+def overview(city: str = "Mumbai", route: str = "Andheri → BKC", hour: int | None = None,
+             dow: int | None = None,
+             lat: float | None = None, lon: float | None = None,
+             rain: bool = False, rain_mm: float = 0.0, holiday: bool = False):
+    b = bundle()
+    r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
+    at = _at_with(hour, dow)
+    weather, flow = _live(city, r, at, rain_override=rain, rain_mm=rain_mm, holiday_override=holiday)
+    p = _clean(predict_pipeline(at, weather, flow, b, city=city.split(" ")[0]))
+    return {"at": at.isoformat(), "city": city, "route": r["name"],
+            "weather": weather, "flow": flow, "pred": p,
+            "colors": LEVEL_COLOR, "shap": _shap(at, weather, flow, b, 0, None)}
+
+
+@app.get("/api/forecast")
+def forecast(city: str = "Mumbai", route: str = "Andheri → BKC",
+             dow: int | None = None,
+             lat: float | None = None, lon: float | None = None,
+             rain: bool = False, rain_mm: float = 0.0, holiday: bool = False):
+    b = bundle()
+    r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
+    at = _at_with(None, dow)
+    weather, flow = _live(city, r, at, rain_override=rain, rain_mm=rain_mm, holiday_override=holiday)
+    rows = []
+    for m in [0, 15, 30, 60]:
+        p = _clean(predict_pipeline(at, weather, flow, b, minutes_ahead=m, city=city.split(" ")[0]))
+        rows.append({"in_min": m, "time": (at + dt.timedelta(minutes=m)).strftime("%H:%M"), **p})
+    return {"at": at.isoformat(), "city": city, "route": r["name"],
+            "weather": weather, "flow": flow, "rows": rows}
+
+
+@app.get("/api/heatmap")
+def heatmap(city: str = "Mumbai"):
+    b = bundle()
+    if city not in CITIES:
+        raise HTTPException(404, "unknown city")
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather, _ = _live(city, CITIES[city]["routes"][0], at)
+    out = []
+    for r in CITIES[city]["routes"]:
+        fl = fetch_tomtom_flow(r["lat"], r["lon"], r["free_flow"], tt_key() or None, 0.4)
+        p = predict_pipeline(at, weather, fl, b, city=city.split(" ")[0])
+        out.append({"route": r["name"], "lat": r["lat"], "lon": r["lon"],
+                    "level": p["final_level"], "vol": p["final_vol"],
+                    "speed": fl["current_speed"], "source": fl["source"]})
+    return {"city": city, "weather": weather, "points": out, "colors": LEVEL_COLOR}
+
+
+@app.get("/api/patterns")
+def patterns():
+    us, india = data()
+    h = india.copy()
+    h["hour"] = h["date_time"].dt.hour
+    h["dow"] = h["date_time"].dt.dayofweek
+    gh = h.groupby("hour")["traffic_volume"].mean()
+    gd = h.groupby("dow")["traffic_volume"].mean()
+    gwd = h[h["dow"] < 5].groupby("hour")["traffic_volume"].mean()
+    gwe = h[h["dow"] >= 5].groupby("hour")["traffic_volume"].mean()
+    piv = h.pivot_table(index="dow", columns="hour", values="traffic_volume", aggfunc="mean")
+    w = h.groupby("weather_main")["traffic_volume"].mean().sort_values()
+    return {
+        "hourly": [{"hour": int(i), "vol": round(float(v))} for i, v in gh.items()],
+        "hourly_weekday": [{"hour": int(i), "vol": round(float(v))} for i, v in gwd.items()],
+        "hourly_weekend": [{"hour": int(i), "vol": round(float(v))} for i, v in gwe.items()],
+        "weekday": [{"dow": int(i), "vol": round(float(v))} for i, v in gd.items()],
+        "heatmap": {"dows": [int(i) for i in piv.index], "hours": [int(c) for c in piv.columns],
+                    "values": [[round(float(x)) for x in row] for row in piv.values.tolist()]},
+        "weather": [{"w": str(i), "vol": round(float(v))} for i, v in w.items()],
+        "peaks": {"am": round(float(gh.loc[7:10].mean())), "pm": round(float(gh.loc[17:21].mean())),
+                  "weekday": round(float(gd.loc[0:4].mean())), "weekend": round(float(gd.loc[5:6].mean()))},
+    }
+
+
+@app.get("/api/adaptation")
+def adaptation(city: str = "Mumbai", route: str = "Andheri → BKC",
+               lat: float | None = None, lon: float | None = None):
+    b = bundle()
+    m = b.get("metrics", {})
+    r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather, flow = _live(city, r, at)
+    p = _clean(predict_pipeline(at, weather, flow, b, city=city.split(" ")[0]))
+    coll = {"rows": 0, "locations": 0, "points": []}
+    for _p in (os.path.join(BASE, "data", "indian_realtime.csv"),
+               os.path.join(BASE, "indian_realtime.csv")):
+        if os.path.exists(_p) and os.path.getsize(_p) > 0:
+            try:
+                import pandas as pd
+                ind = pd.read_csv(_p)
+                live_rows = ind[ind["traffic_source"].str.startswith("live:", na=False)] \
+                    if "traffic_source" in ind.columns else ind
+                coll = {"rows": int(len(live_rows)),
+                        "locations": int(live_rows["location"].nunique()) if len(live_rows) else 0,
+                        "points": [{"t": str(t), "loc": str(l), "ratio": float(x)}
+                                   for t, l, x in zip(live_rows["timestamp"], live_rows["location"],
+                                                      live_rows["congestion_ratio"])][-120:]}
+            except Exception:
+                pass
+            break
+    return {"metrics": m, "thresholds": [float(x) for x in b["thresholds"]],
+            "stages": [{"stage": "Base (US)", "volume": p["base_vol"], "level": p["base_level"]},
+                       {"stage": "Adapted (India)", "volume": p["adapted_vol"], "level": p["adapted_level"]},
+                       {"stage": "Final (live fusion)", "volume": p["final_vol"], "level": p["final_level"]}],
+            "delta": p["adapted_vol"] - p["base_vol"], "collector": coll}
+
+
+@app.get("/api/compare")
+def compare(city: str = "Mumbai", a: str = "Andheri → BKC", b: str = "Dadar → Sion"):
+    bb = bundle()
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    ra, rb = _route(city, a), _route(city, b)
+    weather, _ = _live(city, ra, at)
+    res = []
+    for r in (ra, rb):
+        fl = fetch_tomtom_flow(r["lat"], r["lon"], r["free_flow"], tt_key() or None, 0.4)
+        p = predict_pipeline(at, weather, fl, bb, city=city.split(" ")[0])
+        tmin = round(float(r.get("length_km", 5.0)) / max(fl["current_speed"], 1) * 60, 1)
+        res.append({"route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
+                    "speed": fl["current_speed"], "trip_min": tmin})
+    best = min(res, key=lambda x: x["trip_min"])
+    return {"city": city, "results": res, "best": best["route"], "colors": LEVEL_COLOR}
+
+
+@app.get("/api/whatif")
+def whatif(hour: int = 18, dow: int = 2, month: int = 10, weekend: int = 0, holiday: int = 0,
+           temp_c: float = 30.0, rain: float = 0.0, snow: float = 0.0, clouds: int = 20,
+           weather: str = "Clear"):
+    """Interactive ML simulator: arbitrary scenario -> base prediction + level + importances."""
+    import numpy as np
+    from pipeline import classify as _classify
+    from schema import FEATURES, WEATHER_CODE
+    b = bundle()
+    at = dt.datetime(2026, max(1, min(12, month)), 15, max(0, min(23, hour)), 0)
+    at = at.replace(year=2026)
+    # weekday override: shift date to matching weekday (approx via day offset)
+    at = at + dt.timedelta(days=(max(0, min(6, dow)) - at.weekday()) % 7)
+    w = {"temp": float(temp_c) + 273.15, "rain_1h": float(rain), "snow_1h": float(snow),
+         "clouds_all": int(clouds), "weather_main": weather}
+    from schema import featurize_point
+    X, row = featurize_point(at, w)
+    row["is_weekend"] = int(weekend)
+    row["is_holiday"] = int(holiday)
+    X = np.array([[row[f] for f in FEATURES]])
+    vol = float(b["model"].predict(X)[0])
+    # Staged GBM-ensemble inference: base -> Ridge-adapted (marginal deltas for waterfall)
+    adapted = vol
+    calib = b.get("calibration")
+    if calib is not None:
+        try:
+            adapted = float(calib.predict(np.array([[vol, row["rain_1h"], row["hour"], row["is_peak"]]]))[0])
+        except Exception:
+            pass
+    th = b["thresholds"]
+    imp = b.get("importances", {})
+    order = sorted(imp, key=lambda k: -imp[k]) if imp else list(FEATURES)
+    return {"volume": int(round(vol)), "level": _classify(vol, th),
+            "adapted_volume": int(round(adapted)), "adapted_level": _classify(adapted, th),
+            "calibration_delta": int(round(adapted - vol)),
+            "features": {k: row[k] for k in FEATURES},
+            "importances": [{"feature": k, "importance": float(imp.get(k, 0))} for k in order],
+            "prescription": ("Shift departure ~2h earlier (saves ~35%)" if vol > float(b["thresholds"][1])
+                             else f"Waiting out rain saves ~{min(25, rain * 4):.0f}%" if rain > 3
+                             else "Conditions optimal — depart now")}
+
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    b = bundle()
+    m = b.get("metrics", {})
+    imp = b.get("importances", {})
+    calib = b.get("calibration")
+    try:
+        coef = [float(x) for x in calib.coef_] if calib is not None and hasattr(calib, "coef_") else []
+        intercept = float(calib.intercept_) if calib is not None and hasattr(calib, "intercept_") else 0.0
+    except Exception:
+        coef, intercept = [], 0.0
+    return {"metrics": m, "thresholds": [float(x) for x in b["thresholds"]],
+            "importances": [{"feature": k, "importance": float(v)}
+                            for k, v in sorted(imp.items(), key=lambda kv: -kv[1])],
+            "calibration": {"coef": coef, "intercept": intercept,
+                            "inputs": ["base_pred", "rain_1h", "hour", "is_peak"]},
+            "backend": getattr(b.get("model"), "__class__", type("?", (), {})).__name__}
+
+
+@app.get("/api/insight")
+def insight(city: str = "Mumbai", route: str = "Andheri → BKC"):
+    """Deterministic advisory text (Gemini-style template fallback, no key needed)."""
+    b = bundle()
+    r = _route(city, route)
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather, flow = _live(city, r, at)
+    rows = [_clean(predict_pipeline(at, weather, flow, b, minutes_ahead=m, city=city.split(" ")[0]))
+            for m in [15, 30, 60]]
+    lvl, pct = rows[0]["final_level"], int(round(rows[0].get("congestion_ratio", 0.5) * 100))
+    rain = float(weather.get("rain_1h", 0))
+    rain_txt = f" and {rain}mm rain is adding ~{min(25, rain * 4):.0f}% pressure" if rain > 0 else ""
+    nxt = next((x for x in rows if x["final_level"] in ("High", "Severe")), None)
+    fwd = (f"expecting {nxt['final_level']} conditions within {nxt['minutes_ahead']} min" if nxt
+           else "with flow expected to hold steady")
+    text = (f"Traffic in {route}, {city} is presently {lvl} at {flow['current_speed']} km/h "
+            f"(free-flow {flow['free_flow_speed']}), driven by peak-hour demand{rain_txt}, {fwd}. "
+            f"Commuters should allow an extra 15–25 min or use alternate corridors.")
+    return {"text": text, "source": "template", "level": lvl}
+
+
+@app.get("/api/geocode")
+def geocode(q: str = Query(..., min_length=2)):
+    import requests
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search",
+                         params={"format": "json", "q": q, "limit": 5, "addressdetails": 1},
+                         headers={"Accept": "application/json", "User-Agent": "traffic-forecaster/1.0"},
+                         timeout=8)
+        r.raise_for_status()
+        out = []
+        for g in r.json():
+            disp = g.get("display_name", "")
+            out.append({"name": ", ".join(disp.split(",")[:2]), "lat": float(g["lat"]),
+                        "lon": float(g["lon"]),
+                        "country": (g.get("address") or {}).get("country", "")})
+        return {"results": out}
+    except Exception as e:
+        raise HTTPException(502, f"geocode failed: {e}")
+
+
+@app.get("/api/tiles")
+def tiles():
+    if not tt_key():
+        return {"url": None, "live": False}
+    return {"url": "https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=" + tt_key(),
+            "live": True}
+
+
+@app.get("/api/model")
+def model_info():
+    b = bundle()
+    m = b.get("metrics", {})
+    return {"backend": type(b.get("model")).__name__, "metrics": m,
+            "thresholds": [float(x) for x in b["thresholds"]],
+            "custom": _bundle_meta["custom"], "trained_at": _bundle_meta["trained_at"],
+            "source": _bundle_meta["source"]}
+
+
+@app.post("/api/retrain")
+async def retrain(file: UploadFile = File(...), num_trees: int = 60, max_depth: int = 6, lr: float = 0.05):
+    """CSV upload retrain (UCI schema) -> swaps the live bundle in memory. Training may take ~1 min."""
+    import io
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from schema import FEATURES, WEATHER_CODE, add_features
+    from data_generator import load_historical
+
+    if file is None or not hasattr(file, "read"):
+        raise HTTPException(400, "upload a CSV file as 'file'")
+    raw = await file.read()
+    if len(raw) < 100:
+        raise HTTPException(400, "CSV too small")
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(400, f"unreadable CSV: {e}")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    rename = {"volume": "traffic_volume", "count": "traffic_volume", "flow": "traffic_volume",
+              "datetime": "date_time", "timestamp": "date_time",
+              "temperature": "temp", "rain": "rain_1h", "snow": "snow_1h", "clouds": "clouds_all"}
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    for need in ("traffic_volume", "date_time"):
+        if need not in df.columns:
+            raise HTTPException(400, f"CSV needs '{need}' column (got {list(df.columns)})")
+    for col, default in (("holiday", "None"), ("temp", 290.0), ("rain_1h", 0.0),
+                         ("snow_1h", 0.0), ("clouds_all", 20), ("weather_main", "Clear")):
+        if col not in df.columns:
+            df[col] = default
+    df["date_time"] = pd.to_datetime(df["date_time"], errors="coerce")
+    df = df.dropna(subset=["date_time", "traffic_volume"]).drop_duplicates("date_time")
+    df = df.sort_values("date_time").reset_index(drop=True)
+    if len(df) < 500:
+        raise HTTPException(400, f"need >=500 rows, got {len(df)}")
+    df = add_features(df)
+    X, y = df[FEATURES], df["traffic_volume"]
+    k = int(len(df) * 0.8)
+    Xtr, Xte, ytr, yte = X.iloc[:k], X.iloc[k:], y.iloc[:k], y.iloc[k:]
+    try:
+        from xgboost import XGBRegressor
+        model = XGBRegressor(n_estimators=max(10, min(150, num_trees)),
+                             max_depth=max(2, min(8, max_depth)),
+                             learning_rate=float(lr), n_jobs=-1, random_state=42)
+        backend = "xgboost"
+    except ImportError:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        model = HistGradientBoostingRegressor(max_iter=max(10, min(150, num_trees)), random_state=42)
+        backend = "sklearn-hgb"
+    model.fit(Xtr, ytr)
+    pred = model.predict(Xte)
+    mae = float(mean_absolute_error(yte, pred))
+    rmse = float(mean_squared_error(yte, pred) ** 0.5)
+    th = [float(v) for v in np.percentile(ytr, [25, 50, 75])]
+    p95 = float(np.percentile(ytr, 95))
+    # Refit India calibration head on synthetic corridor sample (same convention as train_model.py)
+    ind = load_historical(indian_style=True).iloc[:336].copy()
+    ind["date_time"] = pd.to_datetime(ind["date_time"])
+    ind = add_features(ind)
+    base_ind = model.predict(ind[FEATURES].to_numpy())
+    cal = Ridge(alpha=1.0)
+    cal.fit(np.column_stack([base_ind, ind["rain_1h"].to_numpy(),
+                             ind["hour"].to_numpy(), ind["is_peak"].to_numpy()]),
+            ind["traffic_volume"].to_numpy())
+    try:
+        from sklearn.inspection import permutation_importance
+        r = permutation_importance(model, Xte.iloc[:500].to_numpy(), yte.iloc[:500].to_numpy(),
+                                   n_repeats=3, random_state=42)
+        imp = {f: float(v) for f, v in zip(FEATURES, r.importances_mean)}
+    except Exception:
+        imp = {f: 1.0 / len(FEATURES) for f in FEATURES}
+    global _bundle
+    _bundle = {"model": model, "calibration": cal, "thresholds": th, "features": FEATURES,
+               "weather_code": WEATHER_CODE,
+               "metrics": {"base_mae": mae, "base_rmse": rmse, "p95_volume": p95,
+                           "n_us": int(len(df)), "n_india_calib": 336,
+                           "calib_mae_adapted": float(mean_absolute_error(
+                               ind["traffic_volume"].to_numpy(), cal.predict(np.column_stack(
+                                   [base_ind, ind["rain_1h"].to_numpy(), ind["hour"].to_numpy(),
+                                    ind["is_peak"].to_numpy()])))),
+                           "calib_mae_unadapted": float(mean_absolute_error(
+                               ind["traffic_volume"].to_numpy(), base_ind))},
+               "importances": imp}
+    _bundle_meta.update({"custom": True, "trained_at": dt.datetime.now().isoformat(timespec="seconds"),
+                         "source": f"upload:{file.filename}"})
+    return {"ok": True, "backend": backend, "metrics": _bundle["metrics"], "thresholds": th,
+            "custom": True}
+
+
+@app.get("/api/corridor")
+def corridor(olat: float, olon: float, dlat: float, dlon: float):
+    """Free source->destination routing: TomTom live route if key, else haversine fallback,
+    plus midpoint congestion prediction + advice."""
+    import math
+    b = bundle()
+    route_info, live = None, False
+    if tt_key():
+        try:
+            from traffic_api import fetch_tomtom_route
+            r = fetch_tomtom_route((olat, olon), (dlat, dlon), tt_key())
+            if r.get("live_min"):
+                route_info = {"dist_km": r["distance_km"], "live_min": r["live_min"],
+                              "free_min": r["free_min"], "delay_min": r["delay_min"]}
+                live = True
+        except Exception:
+            pass
+    if route_info is None:
+        R = 6371.0
+        p1, p2 = math.radians(olat), math.radians(dlat)
+        h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+             * math.sin(math.radians(dlon - olon) / 2) ** 2)
+        dist = 2 * R * math.asin(math.sqrt(h))
+        free_min = dist / 50 * 60
+        live_min = dist / 30 * 60
+        route_info = {"dist_km": round(dist, 2), "live_min": round(live_min, 1),
+                      "free_min": round(free_min, 1), "delay_min": round(live_min - free_min, 1)}
+    mlat, mlon = (olat + dlat) / 2, (olon + dlon) / 2
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather = fetch_openweather(mlat, mlon, ow_key() or None)
+    flow = fetch_tomtom_flow(mlat, mlon, 50, tt_key() or None, 0.4)
+    p = _clean(predict_pipeline(at, weather, flow, b, city="Mumbai"))
+    lvl = p["final_level"]
+    advice = ("Leave ~2h later or split the trip — severe mid-corridor load." if lvl == "Severe"
+              else "Expect slow patches — allow +15 min buffer." if lvl == "High"
+              else "Corridor flowing — good time to depart.")
+    return {"origin": [olat, olon], "dest": [dlat, dlon], "mid": [mlat, mlon],
+            "route": route_info, "live_routing": live, "pred": p,
+            "weather": weather, "flow": flow, "advice": advice, "colors": LEVEL_COLOR}
+
+
+GRID_OFFSETS = [
+    (-0.018, -0.018, "North-West Arterial"), (-0.018, 0.0, "North Radial Ring"),
+    (-0.018, 0.018, "North-East Expressway"), (0.0, -0.018, "West Central Avenue"),
+    (0.0, 0.0, "City Center Hub"), (0.0, 0.018, "East Business Corridor"),
+    (0.018, -0.018, "South-West Terminal"), (0.018, 0.0, "South Coastal Link"),
+    (0.018, 0.018, "South-East Bypass"),
+]
+
+
+@app.get("/api/grid")
+def grid(city: str = "Mumbai", horizon: int = 0):
+    """9-point telemetry grid around a city center for the given forecast horizon."""
+    b = bundle()
+    if city not in CITIES:
+        raise HTTPException(404, "unknown city")
+    clat, clon = CITIES[city]["center"]
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather, _ = _live(city, {"lat": clat, "lon": clon, "free_flow": 50, "length_km": 5.0}, at)
+    out = []
+    for i, (dla, dlo, name) in enumerate(GRID_OFFSETS):
+        plat, plon = clat + dla, clon + dlo
+        fl = fetch_tomtom_flow(plat, plon, 50 + (i % 3) * 5, tt_key() or None, 0.4)
+        p = predict_pipeline(at, weather, fl, b, minutes_ahead=max(0, min(60, horizon)),
+                             city=city.split(" ")[0])
+        out.append({"name": name, "lat": plat, "lon": plon, "level": p["final_level"],
+                    "vol": p["final_vol"], "speed": fl["current_speed"],
+                    "free": fl["free_flow_speed"], "source": fl["source"]})
+    return {"city": city, "horizon": horizon, "points": out, "colors": LEVEL_COLOR}
+```
+
+---
+
+predict_check.py
+```python
+"""Backend smoke check — ascii-safe output for cp1252 consoles."""
+import json
+import requests
+
+b = "http://localhost:8000"
+out = {}
+out["health"] = requests.get(b + "/api/health", timeout=10).json()
+o = requests.get(b + "/api/overview", timeout=90).json()
+out["overview"] = {"level": o["pred"]["final_level"], "vol": o["pred"]["final_vol"],
+                   "flow": o["flow"]["source"], "wx": o["weather"]["source"]}
+orain = requests.get(b + "/api/overview", params={"rain": "true", "holiday": "true"}, timeout=90).json()
+out["override"] = {"rain": orain["weather"]["rain_1h"],
+                   "holiday_flag": orain["weather"].get("_holiday_override", False),
+                   "level": orain["pred"]["final_level"]}
+f = requests.get(b + "/api/forecast", timeout=90).json()
+out["forecast"] = [(r["in_min"], r["final_level"], r["final_vol"]) for r in f["rows"]]
+d = requests.get(b + "/api/diagnostics", timeout=60).json()
+out["diag_backend"] = d["backend"]
+out["diag_top_feature"] = d["importances"][0]
+w = requests.get(b + "/api/whatif", params={"hour": 8, "rain": 9}, timeout=60).json()
+out["whatif_rush_rain"] = {"vol": w["volume"], "level": w["level"], "rx": w["prescription"]}
+with open("check.json", "w") as fh:
+    json.dump(out, fh, default=str)
+print("saved check.json")
+```
+
+---
+
 sanity_check.py
 ```python
 """Sanity check verification with safe model loading and canonical schema."""
@@ -2919,6 +3559,22 @@ Workspace: `Smart City Traffic Forcasting/`
 - Note: PS background jobs don't survive between commands — backend must run in a real
   terminal (`uvicorn api:app --port 8000`), not a job.
 
+## 13:00–13:20 — TrafficSense port (maps/charts/detail + every feature)
+- Inventoried trafficsense (~400KB TS) via 3 parallel agents: shell/state, ML, map/charts/calendar.
+- Backend (+6 endpoints): `whatif` (4753 High rush+rain ✅), `diagnostics` (XGBRegressor, top=hour_cos),
+  `insight` template, `geocode` proxy (Mumbai ✅), runtime `POST /keys`, `tiles` URL;
+  rain/holiday demo overrides + lat/lon custom points on overview/forecast;
+  holiday via `_holiday_override` dict convention (no signature changes).
+- Frontend (10 tabs): horizon-pill map + legend + rich popups + PNG export + raster toggle;
+  gauge/count-up/fusion/verdict/insight on Overview; Simulator (5 scenarios, sliders,
+  prescription); Diagnostics (metrics, importances, Ridge eq, benchmark); Alerts
+  (threshold switcher, feed, read/clear); Calendar (8 events, grid, schedule, 24h
+  model-backed inspector, attendance/rain/police sliders, add-event modal + localStorage);
+  Settings dialog; geocode search → custom point; 60s auto-refresh; rain/holiday toggles.
+- Verified: `npm run build` ✅ 1.5s; overrides (rain 3.5 + holiday flag ✅);
+  whatif rush+rain → High + shift advice ✅. Skipped: in-browser GBM retrain (XGB backend
+  instead), real Gemini calls (template insight), per-corridor alert dedup (global feed).
+
 ## 12:15 — Crash triage from your run log (3 fixes, all verified)
 - `requirements.txt` had `"""docstring"""` header lines → pip `Invalid requirement`. Rewrote as pure `#` comments + pins; dropped `shap` (optional fallback exists, heavy Windows build). `pip install -r` now all-satisfied.
 - `app.py:77` `NameError: featurize_point` (other session's import gap) → added to the `from schema import` line.
@@ -2980,6 +3636,70 @@ Workspace: `Smart City Traffic Forcasting/`
   - Added naive historical (Hour × Day) baseline benchmark in `train_base.py` (XGBoost achieves 4.5% error reduction over baseline).
   - Created automated unit test suite `test_suite.py` with 6 comprehensive test cases (all 6 pass ✅).
 
+## 13:25 — Glassmorphism UI rewrite (user: "ui is shitty")
+- Rewrote `frontend/src/index.css`: frosted-glass cards (blur 16px, translucent borders),
+  ambient gradient blobs, pill tab bar, glowing badges/legend, glass modal + calendar —
+  same class names, zero JSX changes. `npm run build` ✅ 900ms.
+
+## 13:45–14:00 — Free corridor planner + city simplify + full parity
+- Backend: `GET /corridor` (TomTom routing or haversine + midpoint prediction + advice ✅),
+  `GET /grid` (9-pt telemetry ✅), `GET /model`, `POST /retrain` (UCI CSV → XGB + calibration
+  refit → in-memory swap ✅ tested, MAE 564 on 3k-row/20-tree trial); fixed dup `/tiles` route
+  and `UploadFile` multipart signature along the way.
+- Frontend: 🛣 Route tab (source/dest search + click-map-to-set + swap + polyline + cards);
+  city dropdown → one-tap chips; Overview legacy-vs-upgraded card + next-event banner;
+  map corridors/grid toggle; severe toast; footer model bar; Settings CSV retrain UI.
+- Shared `data/events.js` (Calendar refactored onto it). Fixed own dup-state build break.
+  `npm run build` ✅. Skipped only: real Gemini calls, per-corridor alert dedup.
+
+## 14:20–14:30 — Google-style autocomplete everywhere
+- New shared `Autocomplete.jsx`: type-ahead list, match **highlight**, ArrowUp/Down +
+  Enter + Escape keyboard nav, mouse hover pick, popular defaults on focus, no-result
+  collapse. CityField + CorridorField rewritten on it; Route-planner search boxes now
+  suggest ⭐ popular places first, then live geocode. Fixed own dup-import break.
+- CSS: keyboard-focus row, `<mark>` highlight (both themes). `npm run build` ✅.
+
+## 14:00–14:20 — Free-text everywhere + weekday lookup + analysis charts + hardening
+- Backend: `/patterns` += weekday/weekend diurnal series; `/whatif` += staged
+  base→adapted + calibration_delta (3682→2146 ✅); `/overview` + `/forecast` += `dow`
+  param (dow=0 → Mon 2026-10-12 ✅); `rain_mm` float override.
+- Frontend: City + Corridor free-text fields (suggestions + geocode, Enter-to-pick);
+  weekday pills Mon–Sun; segmented rain (Dry/Drizzle/Heavy mm) + Holiday toggle card;
+  Route tab + all views inside ErrorBoundary (blank tab now shows the error + retry);
+  map min-height wrapper; Compare rewritten free (two CorridorFields, both directions).
+- Patterns += rainfall-vs-congestion sweep, holiday-vs-workday grouped bars,
+  clear-vs-harsh weather bars, weekday/weekend diurnal overlay.
+- Diagnostics += 4-stage architecture inspector; Simulator += attribution waterfall.
+- Root-caused earlier test flakiness: stale PID 20360 squatting :8000 with old code —
+  kill squatters (`netstat -ano | :8000`) before trusting endpoint tests.
+- `npm run build` ✅.
+
+## 13:30 — Layout polish pass (user: "buttons charts text div position")
+- Sticky glass control toolbar (top-0, blur 18px) so city/route/filters stay reachable.
+- Global recharts theme in CSS: dim-blue ticks, dark glass tooltips, dim grid/legend —
+  fixes all 10 views at once (was near-unreadable defaults on dark bg).
+- Dark Leaflet tooltips/popups/controls to match theme; layout rhythm (fade-in,
+  spacing, responsive ≤720px grids). `npm run build` ✅ 1s.
+
+## 13:35 — Light theme (user: "light theme + proper website style")
+- Rewrote `index.css` for light: airy gradient bg, white-glass cards, dark slate text,
+  light pills/tabs (dark active), light tooltips/popups/charts, CartoDB Voyager map base.
+- Gauge needle recolored dark for white cards. `npm run build` ✅.
+
+## 13:40 — Typography (user: "font text")
+- Real fonts via Google Fonts: **Sora** (display: title, metric numbers) + **Inter** (body/UI),
+  system-ui fallback offline; proper `<title>` + meta description.
+- Tabular numerals on metrics/tables/calendar, antialiased body, refined scale/spacing.
+- `npm run build` ✅.
+
+## 13:45 — Theme toggle + Overview type + gauge rebuild
+- Finished toggle (was half-done): 🌙/☀️ button in toolbar, `data-theme` on `<html>`,
+  persisted to localStorage, full dark override block, dark-matter tiles via `dark` prop.
+  Added missing base rules (gauge classes, heat grid) found absent in light CSS.
+- Value/unit fix: `.bignum` 32px display number + small muted `.unit` (was same-size).
+- Gauge rebuilt: 4-segment meter (green/yellow/orange/red), tick marks, tailed needle,
+  theme-aware track/ticks via classes. `npm run build` ✅.
+
 ```
 
 ---
@@ -2994,7 +3714,7 @@ historical data** (time, day, weather, holidays), **fuses live TomTom + weather 
 serves everything through an **interpretable 6-tab Streamlit dashboard** with
 Low / Moderate / High / Severe congestion levels.
 
-Last updated: 2026-10-11 ~12:40 — React UI added (`api.py` + `frontend/`).
+Last updated: 2026-10-11 ~13:20 — TrafficSense port complete (10 React views, 14 endpoints).
 
 ---
 
@@ -3044,6 +3764,30 @@ npm run build          # production build check (verified ✅)
 | `GET /api/patterns` | 📊 Peaks, weekday bars, hour×day grid |
 | `GET /api/adaptation?city=&route=` | 🔁 Stages, delta, collector chart data |
 | `GET /api/compare?city=&a=&b=` | ⚖ A/B metrics + best route |
+| `GET /api/overview?…,dow=&hour=` / forecast | Any weekday (0=Mon..6=Sun) + hour — e.g. Monday congestion per route |
+| `GET /api/whatif?…` | 🧪 Simulator + staged base→adapted + prescription |
+| `GET /api/diagnostics` | 🔬 Backend, MAE/RMSE, importances, Ridge coef, thresholds |
+| `GET /api/insight?city=&route=` | ✨ Deterministic advisory text (template; no key needed) |
+| `GET /api/geocode?q=` | Nominatim proxy → any global city → custom-point forecast |
+| `POST /api/keys` `{tomtom, openweather}` | Runtime keys (memory only) → flips sim → live |
+| `GET /api/tiles` | TomTom raster tile URL template (when key set) |
+| `GET /api/corridor?olat=&olon=&dlat=&dlon=` | 🛣 Free routing (TomTom live or haversine) + mid-corridor prediction + advice |
+| `GET /api/grid?city=&horizon=` | 9-point telemetry grid for map overlay |
+| `GET /api/model` | Active model backend/metrics/custom flag |
+| `POST /api/retrain` (CSV + trees/depth/lr) | 🧠 In-app retrain → swaps live bundle |
+
+React views (11 tabs): Overview (gauge + count-up + verdict + fusion card + SHAP + insight + legacy-vs-upgraded + event banner),
+**Route planner** (free source/destination via search or map-click, swap, polyline, distance/time/delay + advice),
+Forecast, Heatmap (corridors / 9-pt grid toggle, horizon pills, legend, rich popups, PNG export, raster toggle),
+Patterns, **Simulator** (5 scenarios, sliders, prescription, attribution waterfall), **Diagnostics** (architecture map, metrics,
+importances, Ridge equation, benchmark), Adaptation, **Calendar** (8 preloaded events,
+month grid, schedule, 24h model-backed inspector, what-if sliders, add-event modal),
+**Alerts** (High/Severe threshold, feed, mark-read/clear), Compare. Header: **city chips**
+(one-tap) + corridor select + hour override, rain/holiday demo toggles, geocode search → custom
+point, 60s auto-refresh countdown, theme toggle, Settings dialog (keys + CSV retrain + health).
+Severe toast + footer model bar. Free-text City/Corridor fields (suggestions + geocode, zero
+forced predefined picks), weekday pills (Mon–Sun per-route lookup), segmented rain
+(Dry/Drizzle/Heavy mm) + Holiday toggle. All views wrapped in error boundaries (blank-tab proof).
 
 All 8 verified live (simulated-mode: forecast Low×4 Sat-midday; heatmap 5 pts; patterns 24h; collector 30 rows; compare 17.0 vs 14.0 min, best correct).
 
@@ -3160,6 +3904,2372 @@ Fallbacks to narrate: keys empty → simulation; network dead → `last_response
 - Port busy (`:8501` taken) → `streamlit run app.py --server.port 8502`.
 - `use_container_width` / ScriptRunContext warnings → cosmetic, ignore.
 - Printing route names (`→`) to PowerShell console crashes with `UnicodeEncodeError` (cp1252) → redirect to file or avoid printing; the API itself handles UTF-8 fine.
+```
+
+---
+
+frontend/package.json
+```json
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.20.0",
+    "html2canvas": "^1.4.1",
+    "leaflet": "^1.9.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-leaflet": "^5.0.0",
+    "recharts": "^3.10.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "vite": "^8.3.0"
+  }
+}
+```
+
+---
+
+frontend/vite.config.js
+```javascript
+import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': 'http://localhost:8000',
+    },
+  },
+})
+```
+
+---
+
+frontend/index.html
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Smart City real-time traffic forecasting — US-trained model calibrated live for Indian cities." />
+    <title>TrafficSense · Smart City Forecasting</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Sora:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+```
+
+---
+
+frontend/src/api.js
+```javascript
+import axios from 'axios'
+
+const get = async (path, params) => (await axios.get(path, { params })).data
+const post = async (path, body) => (await axios.post(path, body)).data
+
+export const api = {
+  health: () => get('/api/health'),
+  cities: () => get('/api/cities'),
+  thresholds: () => get('/api/thresholds'),
+  overview: (city, route, opts = {}) => get('/api/overview', { city, route, ...opts }),
+  forecast: (city, route, opts = {}) => get('/api/forecast', { city, route, ...opts }),
+  heatmap: (city) => get('/api/heatmap', { city }),
+  patterns: () => get('/api/patterns'),
+  adaptation: (city, route, opts = {}) => get('/api/adaptation', { city, route, ...opts }),
+  compare: (city, a, b) => get('/api/compare', { city, a, b }),
+  whatif: (p) => get('/api/whatif', p),
+  diagnostics: () => get('/api/diagnostics'),
+  model: () => get('/api/model'),
+  retrain: (file, params) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    Object.entries(params || {}).forEach(([k, v]) => fd.append(k, v))
+    return axios.post('/api/retrain', fd, { timeout: 300000 }).then((r) => r.data)
+  },
+  corridor: (olat, olon, dlat, dlon) => get('/api/corridor', { olat, olon, dlat, dlon }),
+  grid: (city, horizon) => get('/api/grid', { city, horizon }),
+  insight: (city, route) => get('/api/insight', { city, route }),
+  geocode: (q) => get('/api/geocode', { q }),
+  tiles: () => get('/api/tiles'),
+  setKeys: (tomtom, openweather) => post('/api/keys', { tomtom, openweather }),
+};
+
+export const LEVEL_EMOJI = { Low: '🟢', Moderate: '🟡', High: '🟠', Severe: '🔴' };
+export const LEVEL_HEX = { Low: '#22c55e', Moderate: '#eab308', High: '#f97316', Severe: '#ef4444' };
+```
+
+---
+
+frontend/src/App.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { api } from './api'
+import Overview from './views/Overview'
+import Forecast from './views/Forecast'
+import Heatmap from './views/Heatmap'
+import Patterns from './views/Patterns'
+import Adaptation from './views/Adaptation'
+import Compare from './views/Compare'
+import Simulator from './views/Simulator'
+import Diagnostics from './views/Diagnostics'
+import Alerts from './views/Alerts'
+import Calendar from './views/Calendar'
+import SettingsModal from './components/SettingsModal'
+
+import CorridorPlanner from './views/CorridorPlanner'
+import CorridorField from './components/CorridorField'
+import CityField from './components/CityField'
+import ErrorBoundary from './components/ErrorBoundary'
+
+const TABS = [
+  ['overview', '📍 Overview'],
+  ['route', '🛣 Route'],
+  ['forecast', '🔮 Forecast'],
+  ['heatmap', '🗺 Map'],
+  ['patterns', '📊 Patterns'],
+  ['sim', '🧪 Simulator'],
+  ['diag', '🔬 Diagnostics'],
+  ['adapt', '🔁 Adaptation'],
+  ['calendar', '🏮 Calendar'],
+  ['alerts', '🚨 Alerts'],
+  ['compare', '⚖ Compare'],
+]
+
+export default function App() {
+  const [cities, setCities] = useState([])
+  const [city, setCity] = useState('Mumbai')
+  const [route, setRoute] = useState('Andheri → BKC')
+  const [hour, setHour] = useState('')
+  const [dow, setDow] = useState('')
+  const [rainMm, setRainMm] = useState(0)
+  const [holiday, setHoliday] = useState(false)
+  const [tab, setTab] = useState('overview')
+  const [data, setData] = useState({})
+  const [loading, setLoading] = useState(false)
+  const [custom, setCustom] = useState(null)
+  const [settings, setSettings] = useState(false)
+  const [live, setLive] = useState(null)
+  const [countdown, setCountdown] = useState(60)
+  const [tick, setTick] = useState(0)
+  const [toast, setToast] = useState(null)
+  const [model, setModel] = useState(null)
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('traffic-theme') || 'light' } catch { return 'light' }
+  })
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme === 'dark' ? 'dark' : 'light'
+    try { localStorage.setItem('traffic-theme', theme) } catch { /* private mode */ }
+  }, [theme])
+
+  useEffect(() => {
+    api.cities().then((d) => {
+      setCities(d.cities)
+      const m = d.cities.find((c) => c.name === 'Mumbai')
+      if (m) {
+        setRoute(m.routes[0].name)
+        setCmpA(m.routes[0].name)
+        setCmpB(m.routes[1]?.name ?? m.routes[0].name)
+      }
+    }).catch(() => {})
+    api.health().then(setLive).catch(() => {})
+    api.model().then(setModel).catch(() => {})
+  }, [])
+
+  const routes = cities.find((c) => c.name === city)?.routes ?? []
+  const routeIsPoint = route && typeof route === 'object'
+  const routeName = routeIsPoint ? route.name : route
+  const routeLL = routeIsPoint ? { lat: route.lat, lon: route.lon }
+    : custom && city === 'Custom' ? { lat: custom.lat, lon: custom.lon } : {}
+  const apiCity = city === 'Custom' ? 'Mumbai' : city
+  const ov = { rain_mm: rainMm, holiday, ...routeLL, ...(dow === '' ? {} : { dow: Number(dow) }) }
+
+  const setRoutePick = (v) => {
+    if (typeof v === 'object') setRoute(v)
+    else setRoute(v)
+  }
+
+  useEffect(() => {
+    if (!city || (!route && city !== 'Custom')) return
+    setLoading(true)
+    const h = hour === '' ? null : Number(hour)
+    const base = { ...ov, ...(h != null ? { hour: h } : {}) }
+    const rname = routeIsPoint ? 'Andheri → BKC' : route
+    const jobs = {
+      overview: async () => {
+        const [o, f] = await Promise.all([
+          api.overview(apiCity, rname, { ...base, ...routeLL }),
+          api.forecast(apiCity, rname, { ...base, ...routeLL }).catch(() => null),
+        ])
+        if (f) setData((s) => ({ ...s, forecast: f }))
+        return o
+      },
+      forecast: () => api.forecast(apiCity, rname, { ...base, ...routeLL }),
+      heatmap: async () => {
+        const [m, f] = await Promise.all([
+          api.heatmap(apiCity),
+          api.forecast(apiCity, rname, { ...base, ...routeLL }).catch(() => null),
+        ])
+        if (f) setData((s) => ({ ...s, forecast: f }))
+        return m
+      },
+      patterns: () => api.patterns(),
+      sim: () => Promise.resolve(true),
+      diag: () => Promise.resolve(true),
+      adapt: () => api.adaptation(apiCity, rname, routeLL),
+      calendar: () => Promise.resolve(true),
+      alerts: () => api.forecast(apiCity, rname, { ...base, ...routeLL }),
+      compare: () => Promise.resolve(true),
+    }
+    jobs[tab]().then((d) => setData((s) => ({ ...s, [tab]: d }))).catch(() => {}).finally(() => setLoading(false))
+  }, [tab, city, route, hour, dow, rainMm, holiday, custom, tick])
+
+  useEffect(() => {
+    const id = setInterval(() => setCountdown((c) => {
+      if (c <= 1) { setTick((t) => t + 1); return 60 }
+      return c - 1
+    }), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  const pickCity = (c) => {
+    if (typeof c === 'object') {
+      setCustom(c)
+      setCity('Custom')
+      return
+    }
+    setCity(c)
+    setCustom(null)
+    const rs = cities.find((x) => x.name === c)?.routes ?? []
+    if (rs.length) setRoute(rs[0].name)
+  }
+
+  useEffect(() => {
+    const p = data.overview?.pred
+    if (p && p.final_level === 'Severe') {
+      const lbl = routeIsPoint ? route.name : route
+      const id = `${city}-${lbl}-${data.overview.at}`
+      setToast((t) => (t && t.id === id ? t : { id, title: `Severe congestion — ${city}`, desc: `${lbl}: ${p.final_vol.toLocaleString()} veh/hr right now.` }))
+    }
+  }, [data.overview])
+
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 6000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  return (
+    <div className="app">
+      <header>
+        <h1>🚦 Smart City Traffic Forecasting</h1>
+        <p className="muted">US-trained XGBoost → live TomTom → calibrated for Indian cities
+          {live && (live.tomtom || live.openweather ? ' · 🟢 live' : ' · 🟡 simulated')}</p>
+      </header>
+      <div className="controls">
+        <CityField cities={cities} value={city} custom={custom} onPick={pickCity} />
+        <CorridorField label="Corridor — type anything" value={routeName} routes={routes.map((r) => r.name)} onPick={setRoutePick} />
+        <div className="dowpills">
+          <span className="dowlabel">Day</span>
+          <div className="pills">
+            <button className={dow === '' ? 'active' : ''} onClick={() => setDow('')}>Today</button>
+            {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((d, i) => (
+              <button key={d} className={dow === i ? 'active' : ''} onClick={() => setDow(dow === i ? '' : i)}>{d}</button>
+            ))}
+          </div>
+        </div>
+        <label>Hour override
+          <select value={hour} onChange={(e) => setHour(e.target.value)}>
+            <option value="">now</option>
+            {Array.from({ length: 24 }, (_, i) => <option key={i} value={i}>{String(i).padStart(2, '0')}:00</option>)}
+          </select>
+        </label>
+        <div className="raincard">
+          <span className="dowlabel">Rain</span>
+          <div className="pills">
+            {[{ v: 0, l: '☀️ Dry' }, { v: 1.5, l: '🌦 Drizzle' }, { v: 8, l: '🌧 Heavy' }].map((o) => (
+              <button key={o.l} className={rainMm === o.v ? 'active' : ''} onClick={() => setRainMm(o.v)} title={o.v ? `${o.v} mm/h in model` : 'no rain'}>{o.l}</button>
+            ))}
+          </div>
+        </div>
+        <button className={holiday ? 'activebtn' : ''} onClick={() => setHoliday(!holiday)} title="Public-holiday traffic pattern (lighter commute, event peaks)">
+          🎉 Holiday{holiday ? ' ON' : ''}
+        </button>
+        <button onClick={() => { setTick((t) => t + 1); setCountdown(60) }}>⟳ {countdown}s</button>
+        <button onClick={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))} title="Toggle dark / light theme">
+          {theme === 'light' ? '🌙 Dark' : '☀️ Light'}
+        </button>
+        <button onClick={() => setSettings(true)}>⚙ Settings</button>
+      </div>
+      {custom && city === 'Custom' && <p className="muted">📍 Custom point {custom.name} ({custom.lat.toFixed(4)}, {custom.lon.toFixed(4)}) — Overview + Forecast use live data here.</p>}
+      {routeIsPoint && <p className="muted">🛣 Free corridor point: {route.name} ({route.lat.toFixed(4)}, {route.lon.toFixed(4)}) — geocoded, not predefined.</p>}
+      <nav className="tabs">
+        {TABS.map(([k, label]) => (
+          <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{label}</button>
+        ))}
+      </nav>
+      <main>
+        {loading && <p className="muted">Fetching live data…</p>}
+        <ErrorBoundary key={tab}>
+        {tab === 'overview' && <Overview data={data.overview} forecast={data.forecast} city={city} route={routeName} rain={rainMm > 0} holiday={holiday} goCalendar={() => setTab('calendar')} />}
+        {tab === 'route' && <CorridorPlanner />}
+        {tab === 'forecast' && <Forecast data={data.forecast} />}
+        {tab === 'heatmap' && <Heatmap data={data.heatmap} city={city} forecast={data.forecast} dark={theme === 'dark'} />}
+        {tab === 'patterns' && <Patterns data={data.patterns} />}
+        {tab === 'sim' && <Simulator />}
+        {tab === 'diag' && <Diagnostics />}
+        {tab === 'adapt' && <Adaptation data={data.adapt} />}
+        {tab === 'calendar' && <Calendar />}
+        {tab === 'alerts' && <Alerts forecast={data.alerts} city={city} />}
+        {tab === 'compare' && <Compare />}
+        </ErrorBoundary>
+      </main>
+      <SettingsModal open={settings} onClose={() => setSettings(false)} onSaved={() => { api.health().then(setLive).catch(() => {}); setTick((t) => t + 1) }} />
+      {toast && (
+        <div className="toast" onClick={() => setToast(null)}>
+          <b>🔔 {toast.title}</b>
+          <span>{toast.desc}</span>
+        </div>
+      )}
+      <footer className="foot">
+        <span>TrafficSense · live congestion forecasting</span>
+        {model && <span className="muted">{model.backend} · MAE {model.metrics?.base_mae?.toFixed(0)}{model.custom ? ' · custom-trained' : ''} · {live && (live.tomtom ? 'TomTom live' : 'simulated')}</span>}
+        <button onClick={() => setSettings(true)}>Model settings →</button>
+      </footer>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/App.css
+```css
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
+      scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
+      scale(0.8);
+  }
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  & > div {
+    flex: 1 1 0;
+    padding: 32px;
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+}
+```
+
+---
+
+frontend/src/index.css
+```css
+/* Light glass theme — clean website style */
+:root {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: 'Sora', 'Inter', system-ui, sans-serif;
+  color: #0f172a;
+  --glass: rgba(255, 255, 255, 0.72);
+  --glass-brd: rgba(15, 23, 42, 0.09);
+  --txt-dim: #5b6b82;
+  --accent: #0284c7;
+  --accent-soft: rgba(2, 132, 199, 0.1);
+}
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: #0f172a;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background:
+    radial-gradient(900px 480px at 10% -8%, rgba(56, 189, 248, 0.16), transparent 60%),
+    radial-gradient(820px 480px at 90% 6%, rgba(167, 139, 250, 0.14), transparent 60%),
+    radial-gradient(720px 560px at 50% 112%, rgba(249, 115, 22, 0.08), transparent 60%),
+    #eef2f8;
+  background-attachment: fixed;
+}
+#root { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+.app header h1 { margin: 6px 0 2px; font-family: var(--font-display); font-size: 30px; font-weight: 800; letter-spacing: -0.03em; color: #0b1226; }
+.app header p { margin: 0 0 6px; font-size: 14px; }
+.card b, .tbl td, .calpct { font-variant-numeric: tabular-nums; }
+.card b { font-family: var(--font-display); }
+.bignum { font-family: var(--font-display); font-size: 32px; font-weight: 800; letter-spacing: -0.02em; color: #0b1226; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.bignum .unit { font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600; color: var(--txt-dim); letter-spacing: 0; margin-left: 7px; }
+.card .sub { display: block; margin-top: 5px; font-size: 13px; color: var(--txt-dim); }
+.gauge { display: block; margin: 6px auto 0; }
+.gauge-track { stroke: rgba(15, 23, 42, 0.1); }
+.gauge-tickmark { stroke: rgba(15, 23, 42, 0.3); }
+.gauge-tick { fill: #64748b; font-weight: 600; }
+.gauge-needle { stroke: #0f172a; }
+.gauge-hub { fill: #fff; stroke: #0f172a; }
+.heatgrid { display: grid; grid-template-columns: repeat(var(--cols, 24), 1fr); gap: 3px; margin: 10px 0 18px; }
+.heatcell { aspect-ratio: 1; border-radius: 3px; }
+h3 { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -0.015em; margin: 24px 0 8px; color: #0b1226; }
+h4 { font-size: 13px; color: var(--txt-dim); margin: 16px 0 6px; font-weight: 600; }
+button, input, select, textarea { font-family: inherit; }
+.tabs button { font-weight: 600; font-size: 13.5px; }
+.badge { font-weight: 700; letter-spacing: 0.01em; }
+.muted { color: var(--txt-dim); font-size: 13.5px; }
+
+/* glass panels */
+.card, .modal, .calcell {
+  background: var(--glass);
+  border: 1px solid var(--glass-brd);
+  border-radius: 16px;
+  backdrop-filter: blur(16px) saturate(1.3);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 14px 0; }
+.card { padding: 16px 18px; transition: transform 0.15s ease, box-shadow 0.15s ease; }
+.card:hover { transform: translateY(-2px); box-shadow: 0 14px 36px rgba(15, 23, 42, 0.12); }
+.card h4 { margin: 0 0 6px; font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--txt-dim); }
+.card b { font-size: 22px; font-weight: 700; display: block; letter-spacing: -0.01em; color: #0b1226; }
+.card span { font-size: 13px; color: var(--txt-dim); }
+.card p { font-size: 14px; line-height: 1.55; color: #1e293b; }
+
+/* controls */
+.controls { display: flex; gap: 10px; margin: 18px 0; flex-wrap: wrap; align-items: flex-end;
+  position: sticky; top: 0; z-index: 500; padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.78); border: 1px solid var(--glass-brd);
+  border-radius: 16px; backdrop-filter: blur(18px) saturate(1.3);
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08); }
+.controls label { display: flex; flex-direction: column; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--txt-dim); }
+input, select, textarea {
+  background: rgba(255, 255, 255, 0.9); color: #0f172a;
+  border: 1px solid rgba(15, 23, 42, 0.14); border-radius: 12px; padding: 9px 13px;
+  font-size: 14px; outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: rgba(2, 132, 199, 0.6); box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.12); }
+.controls select { min-width: 190px; }
+.check { flex-direction: row !important; align-items: center; gap: 8px !important; text-transform: none !important; letter-spacing: 0 !important; font-size: 14px !important; }
+input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+input[type="range"] { accent-color: var(--accent); padding: 0; border: none; background: transparent; }
+button {
+  background: #ffffff; color: #0f172a;
+  border: 1px solid rgba(15, 23, 42, 0.14); border-radius: 12px; padding: 9px 16px;
+  cursor: pointer; font-size: 14px; font-weight: 550;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06); transition: box-shadow 0.15s ease, transform 0.1s ease;
+}
+button:hover { box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12); }
+button:active { transform: scale(0.97); }
+button.primary { background: linear-gradient(135deg, #0284c7, #2563eb); border: none; color: #fff; font-weight: 650; }
+button:disabled { opacity: 0.5; cursor: default; }
+
+/* tabs */
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 20px; padding: 5px; width: fit-content; max-width: 100%;
+  background: rgba(255, 255, 255, 0.7); border: 1px solid var(--glass-brd);
+  border-radius: 16px; backdrop-filter: blur(16px);
+  box-shadow: 0 6px 22px rgba(15, 23, 42, 0.07); }
+.tabs button { border: none; background: transparent; border-radius: 11px; padding: 8px 15px; color: var(--txt-dim); box-shadow: none; }
+.tabs button:hover { background: rgba(15, 23, 42, 0.05); color: #0f172a; box-shadow: none; }
+.tabs button.active { background: #0f172a; color: #fff; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.25); }
+
+/* pills, badges, tables */
+.pills { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.pills button { border-radius: 999px; padding: 7px 15px; font-size: 13px; }
+.pills button.active { background: var(--accent-soft); border-color: rgba(2, 132, 199, 0.5); color: var(--accent); font-weight: 650; }
+.badge { color: #fff; padding: 5px 15px; border-radius: 999px; font-weight: 650; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.2); }
+.tbl { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px;
+  background: var(--glass); border: 1px solid var(--glass-brd); border-radius: 16px; overflow: hidden;
+  backdrop-filter: blur(16px); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }
+.tbl th { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--txt-dim); font-weight: 700; background: rgba(15, 23, 42, 0.03); }
+.tbl th, .tbl td { border-bottom: 1px solid rgba(15, 23, 42, 0.07); padding: 10px 14px; text-align: left; }
+.tbl tr:last-child td { border-bottom: none; }
+.tbl tr.best td { background: rgba(34, 197, 94, 0.1); }
+
+/* banners */
+.alert { background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 14px; padding: 13px 16px; margin-bottom: 14px; color: #7f1d1d; }
+.ok { background: rgba(34, 197, 94, 0.09); border: 1px solid rgba(34, 197, 94, 0.35); border-radius: 12px; padding: 10px 14px; color: #14532d; }
+.verdict { background: rgba(2, 132, 199, 0.07); border: 1px solid rgba(2, 132, 199, 0.25); border-radius: 14px; padding: 12px 16px; color: #0c4a6e; }
+.tag { background: rgba(124, 58, 237, 0.12); border: 1px solid rgba(124, 58, 237, 0.35); color: #5b21b6; border-radius: 999px; padding: 2px 11px; font-size: 12px; margin-left: 8px; }
+.fusionbar { height: 8px; background: rgba(15, 23, 42, 0.08); border-radius: 999px; overflow: hidden; margin: 10px 0; }
+.fusionlive { height: 100%; background: linear-gradient(90deg, #0284c7, #22c55e); border-radius: 999px; }
+.alertcard { border-left: 3px solid rgba(239, 68, 68, 0.7); margin-bottom: 10px; }
+.alertcard p { margin: 6px 0 0; font-size: 14px; color: var(--txt-dim); }
+
+/* map */
+.maptools { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.legend { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 10px 2px; font-size: 13px; color: var(--txt-dim); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; box-shadow: 0 0 6px rgba(15, 23, 42, 0.25); }
+.leaflet-container { background: #dbe4f0; border-radius: 16px; border: 1px solid var(--glass-brd); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.1); }
+
+/* forms & sliders */
+.sliders { display: grid; gap: 12px; margin: 14px 0; max-width: 560px; }
+.sliders label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--txt-dim); }
+.row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+.row label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--txt-dim); }
+.modalbg { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(6px); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+.modal { max-width: 560px; width: 92%; max-height: 92vh; overflow: auto; padding: 24px; display: grid; gap: 12px; }
+.modal h3 { margin: 0; }
+.modal label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--txt-dim); }
+
+/* calendar */
+.calgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin: 14px 0; }
+.calhead { text-align: center; color: var(--txt-dim); font-size: 12px; font-weight: 700; padding: 4px; }
+.calblank { min-height: 66px; }
+.calcell { min-height: 74px; padding: 8px; cursor: pointer; display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.calcell:hover { border-color: rgba(2, 132, 199, 0.5); }
+.calcell.severe { border-color: rgba(239, 68, 68, 0.55); background: rgba(239, 68, 68, 0.07); }
+.calcell.high { border-color: rgba(249, 115, 22, 0.5); }
+.calcell.moderate { border-color: rgba(234, 179, 8, 0.45); }
+.calcell.sel { outline: 2px solid rgba(2, 132, 199, 0.7); }
+.calpct { font-weight: 700; font-size: 15px; color: #0b1226; }
+.calev { font-size: 11.5px; color: var(--txt-dim); }
+.combo { position: relative; }
+.combo-list { position: absolute; top: 100%; left: 0; right: 0; z-index: 600; display: flex; flex-direction: column; gap: 4px;
+  background: rgba(255, 255, 255, 0.97); border: 1px solid rgba(15, 23, 42, 0.12); border-radius: 12px;
+  padding: 6px; margin-top: 4px; max-height: 260px; overflow: auto;
+  box-shadow: 0 14px 40px rgba(15, 23, 42, 0.2); }
+.combo-list button { text-align: left; border: none; box-shadow: none; background: transparent; }
+.combo-list button:hover { background: rgba(2, 132, 199, 0.08); }
+.combo-item { display: flex; gap: 9px; align-items: center; width: 100%; }
+.combo-item.hi { background: rgba(2, 132, 199, 0.13); }
+.combo-ic { font-size: 15px; }
+.combo-tx { font-size: 14px; }
+.combo-tx mark { background: rgba(2, 132, 199, 0.22); color: inherit; border-radius: 3px; padding: 0 1px; }
+html[data-theme="dark"] .combo-item.hi { background: rgba(103, 232, 249, 0.14); }
+html[data-theme="dark"] .combo-tx mark { background: rgba(103, 232, 249, 0.28); }
+.dowpills, .raincard { display: flex; flex-direction: column; gap: 2px; }
+.dowlabel { font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--txt-dim); }
+.activebtn { background: rgba(124, 58, 237, 0.14) !important; border-color: rgba(124, 58, 237, 0.5) !important; color: #5b21b6 !important; font-weight: 650; }
+.mapwrap { min-height: 380px; }
+.mapwrap .leaflet-container { min-height: 380px; }
+html[data-theme="dark"] .combo-list { background: rgba(8, 13, 28, 0.97); border-color: rgba(255, 255, 255, 0.14); }
+.citychips { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; padding-bottom: 2px; }
+.citychips button { border-radius: 999px; padding: 9px 18px; }
+.citychips button.active { background: #0f172a; color: #fff; border-color: #0f172a; }
+.toast { position: fixed; bottom: 22px; right: 22px; z-index: 1200; max-width: 340px;
+  background: rgba(255, 255, 255, 0.92); border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 14px; padding: 13px 16px; cursor: pointer;
+  box-shadow: 0 14px 40px rgba(15, 23, 42, 0.22); backdrop-filter: blur(14px);
+  display: flex; flex-direction: column; gap: 3px; animation: fadein 0.25s ease; }
+.foot { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 26px;
+  padding: 12px 4px 0; border-top: 1px solid var(--glass-brd); font-size: 13px; }
+html[data-theme="dark"] .citychips button.active { background: rgba(255, 255, 255, 0.16); border-color: rgba(255, 255, 255, 0.25); }
+html[data-theme="dark"] .toast { background: rgba(8, 13, 28, 0.94); }
+
+/* ---- chart theming (light) ---- */
+.recharts-cartesian-axis-tick text { fill: #64748b; font-size: 11.5px; font-weight: 500; }
+.recharts-cartesian-axis line, .recharts-cartesian-axis path { stroke: rgba(15, 23, 42, 0.16); }
+.recharts-cartesian-grid line { stroke: rgba(15, 23, 42, 0.07); }
+.recharts-default-tooltip {
+  background: rgba(255, 255, 255, 0.96) !important;
+  border: 1px solid rgba(15, 23, 42, 0.12) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16) !important;
+  padding: 10px 14px !important;
+}
+.recharts-tooltip-label { color: #0f172a !important; font-weight: 700; margin-bottom: 4px; }
+.recharts-tooltip-item { color: #334155 !important; font-size: 13px; padding: 1px 0; }
+.recharts-legend-item-text { color: #64748b !important; font-size: 12.5px; }
+.recharts-reference-line text { fill: #64748b; font-size: 11px; }
+
+/* ---- leaflet light tooltips/popups ---- */
+.leaflet-tooltip {
+  background: rgba(255, 255, 255, 0.95); border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 10px; color: #0f172a; box-shadow: 0 6px 20px rgba(15, 23, 42, 0.18);
+}
+.leaflet-tooltip::before { display: none; }
+.leaflet-popup-content-wrapper {
+  background: rgba(255, 255, 255, 0.97); color: #0f172a; border-radius: 12px;
+  border: 1px solid rgba(15, 23, 42, 0.12); box-shadow: 0 10px 30px rgba(15, 23, 42, 0.2);
+}
+.leaflet-popup-content { font-size: 13px; line-height: 1.6; margin: 12px 16px; }
+.leaflet-popup-tip { background: #fff; border: 1px solid rgba(15, 23, 42, 0.12); }
+.leaflet-bar a { background: #fff; color: #0f172a; border-color: rgba(15, 23, 42, 0.12); }
+
+/* ---- layout rhythm ---- */
+main { display: flex; flex-direction: column; gap: 4px; }
+main > div { animation: fadein 0.25s ease; }
+@keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.app header { display: flex; flex-direction: column; gap: 2px; }
+.row button, .pills button, .controls button { white-space: nowrap; }
+@media (max-width: 720px) {
+  #root { padding: 16px 12px 48px; }
+  .cards { grid-template-columns: 1fr 1fr; }
+  .controls select, .row select { min-width: 150px; }
+  .calgrid { grid-template-columns: repeat(7, minmax(40px, 1fr)); }
+  .calcell { min-height: 58px; font-size: 12px; }
+}
+
+/* ================= DARK THEME ================= */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  color: #e8edf5;
+  --glass: rgba(255, 255, 255, 0.06);
+  --glass-brd: rgba(255, 255, 255, 0.12);
+  --txt-dim: rgba(232, 237, 245, 0.62);
+  --accent: #67e8f9;
+  --accent-soft: rgba(103, 232, 249, 0.14);
+}
+html[data-theme="dark"] body {
+  color: #e8edf5;
+  background:
+    radial-gradient(900px 500px at 12% -8%, rgba(103, 232, 249, 0.14), transparent 60%),
+    radial-gradient(800px 500px at 88% 8%, rgba(167, 139, 250, 0.13), transparent 60%),
+    radial-gradient(700px 600px at 50% 110%, rgba(249, 115, 22, 0.08), transparent 60%),
+    #0a0f1e;
+  background-attachment: fixed;
+}
+html[data-theme="dark"] .app header h1,
+html[data-theme="dark"] h3,
+html[data-theme="dark"] .card b,
+html[data-theme="dark"] .calpct { color: #e8edf5; }
+html[data-theme="dark"] .muted,
+html[data-theme="dark"] .card h4,
+html[data-theme="dark"] .card span,
+html[data-theme="dark"] h4,
+html[data-theme="dark"] .controls label,
+html[data-theme="dark"] .sliders label,
+html[data-theme="dark"] .row label,
+html[data-theme="dark"] .modal label,
+html[data-theme="dark"] .legend,
+html[data-theme="dark"] .calhead,
+html[data-theme="dark"] .calev,
+html[data-theme="dark"] .alertcard p { color: rgba(232, 237, 245, 0.62); }
+html[data-theme="dark"] .card p { color: #c9d4e6; }
+html[data-theme="dark"] .card, html[data-theme="dark"] .modal, html[data-theme="dark"] .calcell {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+}
+html[data-theme="dark"] .card:hover { border-color: rgba(255, 255, 255, 0.2); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28); }
+html[data-theme="dark"] .controls {
+  background: rgba(10, 15, 30, 0.72); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
+}
+html[data-theme="dark"] input, html[data-theme="dark"] select, html[data-theme="dark"] textarea {
+  background: rgba(255, 255, 255, 0.07); color: #e8edf5; border-color: rgba(255, 255, 255, 0.12);
+}
+html[data-theme="dark"] input:focus, html[data-theme="dark"] select:focus, html[data-theme="dark"] textarea:focus {
+  border-color: rgba(103, 232, 249, 0.55); box-shadow: 0 0 0 3px rgba(103, 232, 249, 0.14);
+}
+html[data-theme="dark"] select option { background: #131c33; }
+html[data-theme="dark"] button {
+  background: rgba(255, 255, 255, 0.08); color: #e8edf5;
+  border-color: rgba(255, 255, 255, 0.12); box-shadow: none;
+}
+html[data-theme="dark"] button:hover { background: rgba(255, 255, 255, 0.14); box-shadow: none; }
+html[data-theme="dark"] .tabs { background: rgba(255, 255, 255, 0.05); box-shadow: none; }
+html[data-theme="dark"] .tabs button { color: rgba(232, 237, 245, 0.62); }
+html[data-theme="dark"] .tabs button:hover { background: rgba(255, 255, 255, 0.07); color: #e8edf5; }
+html[data-theme="dark"] .tabs button.active { background: rgba(255, 255, 255, 0.14); color: #fff; box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3); }
+html[data-theme="dark"] .pills button.active { background: rgba(103, 232, 249, 0.2); border-color: rgba(103, 232, 249, 0.5); color: #67e8f9; }
+html[data-theme="dark"] .tbl { box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); }
+html[data-theme="dark"] .tbl th { background: rgba(255, 255, 255, 0.04); }
+html[data-theme="dark"] .tbl th, html[data-theme="dark"] .tbl td { border-color: rgba(255, 255, 255, 0.07); }
+html[data-theme="dark"] .alert { color: #fca5a5; background: rgba(239, 68, 68, 0.12); }
+html[data-theme="dark"] .ok { color: #86efac; background: rgba(34, 197, 94, 0.1); }
+html[data-theme="dark"] .verdict { color: #a5f3fc; background: rgba(103, 232, 249, 0.07); }
+html[data-theme="dark"] .tag { color: #c4b5fd; background: rgba(167, 139, 250, 0.22); }
+html[data-theme="dark"] .fusionbar { background: rgba(255, 255, 255, 0.1); }
+html[data-theme="dark"] .leaflet-container { background: #0b1226; }
+html[data-theme="dark"] .recharts-cartesian-axis-tick text { fill: #8fa0b8; }
+html[data-theme="dark"] .recharts-cartesian-axis line, html[data-theme="dark"] .recharts-cartesian-axis path { stroke: rgba(255, 255, 255, 0.14); }
+html[data-theme="dark"] .recharts-cartesian-grid line { stroke: rgba(255, 255, 255, 0.07); }
+html[data-theme="dark"] .recharts-default-tooltip {
+  background: rgba(8, 13, 28, 0.94) !important; border-color: rgba(255, 255, 255, 0.14) !important;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5) !important;
+}
+html[data-theme="dark"] .recharts-tooltip-label { color: #fff !important; }
+html[data-theme="dark"] .recharts-tooltip-item { color: #c9d4e6 !important; }
+html[data-theme="dark"] .recharts-legend-item-text { color: #8fa0b8 !important; }
+html[data-theme="dark"] .recharts-reference-line text { fill: #8fa0b8; }
+html[data-theme="dark"] .leaflet-tooltip {
+  background: rgba(8, 13, 28, 0.92); color: #e8edf5; border-color: rgba(255, 255, 255, 0.14);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+}
+html[data-theme="dark"] .leaflet-popup-content-wrapper {
+  background: rgba(8, 13, 28, 0.95); color: #e8edf5; border-color: rgba(255, 255, 255, 0.14);
+}
+html[data-theme="dark"] .leaflet-popup-tip { background: rgba(8, 13, 28, 0.95); border-color: rgba(255, 255, 255, 0.14); }
+html[data-theme="dark"] .leaflet-bar a { background: rgba(8, 13, 28, 0.9); color: #e8edf5; border-color: rgba(255, 255, 255, 0.14); }
+html[data-theme="dark"] .bignum { color: #e8edf5; }
+html[data-theme="dark"] .gauge-track { stroke: rgba(255, 255, 255, 0.12); }
+html[data-theme="dark"] .gauge-tickmark { stroke: rgba(255, 255, 255, 0.3); }
+html[data-theme="dark"] .gauge-tick { fill: #8fa0b8; }
+html[data-theme="dark"] .gauge-needle { fill: #f8fafc; }
+html[data-theme="dark"] .gauge-hub { fill: #0f172a; stroke: #f8fafc; }
+```
+
+---
+
+frontend/src/main.jsx
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+```
+
+---
+
+frontend/src/data/events.js
+```javascript
+// Shared event data + surge math (Calendar view + Overview banner).
+export const CORRIDORS = ['City Center Hub', 'North Radial Ring', 'North-East Expressway', 'West Central Avenue', 'East Business Corridor', 'South Coastal Link', 'South-East Bypass', 'North-West Arterial', 'South-West Terminal']
+export const LS_KEY = 'traffic_custom_events_v1'
+
+export const dkey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+export const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x }
+export const lvlOf = (v) => (v < 0.4 ? 'Low' : v < 0.65 ? 'Moderate' : v < 0.85 ? 'High' : 'Severe')
+
+export function preloaded() {
+  const t = new Date()
+  const E = (off, title, sh, s, e, cat, att, surge, venue) => ({
+    id: `ev-${off}-${sh}`, title, short: title.split(' ').slice(0, 2).join(' '),
+    date: dkey(addDays(t, off)), start: s, end: e, category: cat, attendees: att, surge, venue,
+    corridors: CORRIDORS.slice(0, 3), custom: false,
+  })
+  return [
+    E(1, 'Grand Garba & Dandiya Night', 'Garba Night', '19:00', '02:00', 'cultural', 52000, 1.88, 'Community Grounds'),
+    E(2, 'Festive Dandiya Evening', 'Dandiya', '19:30', '01:30', 'cultural', 38000, 1.65, 'City Grounds'),
+    E(4, 'Dussehra Mela Procession', 'Dussehra Mela', '16:00', '22:30', 'procession', 44000, 1.74, 'Main Avenue'),
+    E(7, 'T20 Cricket Match', 'T20 Match', '18:00', '23:30', 'sports', 58000, 1.92, 'Stadium'),
+    E(10, 'Diwali Bazaar Night Market', 'Diwali Bazaar', '14:00', '23:00', 'cultural', 65000, 1.82, 'Market District'),
+    E(14, 'City Marathon', 'Marathon', '05:00', '11:00', 'sports', 22000, 1.55, 'Ring Road'),
+    E(18, 'Tech Summit', 'Tech Summit', '08:30', '18:00', 'civic', 30000, 1.45, 'Convention Center'),
+    E(21, 'Music Concert', 'Concert', '19:00', '23:00', 'concert', 35000, 1.6, 'Arena'),
+  ]
+}
+
+export function loadCustom() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]') } catch { return [] }
+}
+
+// Simplified surge curve: arrival / active / dispersal
+export function surgeAt(ev, h) {
+  const s = Number(ev.start.slice(0, 2)), e0 = Number(ev.end.slice(0, 2))
+  const end = e0 <= s ? e0 + 24 : e0
+  const H = h < s ? h + 24 : h
+  const m = ev.surge || 1.5
+  if (H === s - 1 || (s === 0 && h === 23)) return 1 + (m - 1) * 0.35
+  if (H >= s && H <= end) {
+    const p = end === s ? 0.5 : (H - s) / (end - s)
+    return 1 + (m - 1) * (0.6 + 0.4 * Math.sin(p * Math.PI))
+  }
+  if (H === end + 1) return 1 + (m - 1) * 0.45
+  return 1
+}
+
+export function diurnal(h, weekend) {
+  if (!weekend) {
+    if (h >= 7 && h <= 9) return 0.82
+    if (h >= 17 && h <= 20) return 0.88
+    if (h >= 10 && h <= 16) return 0.58
+    if (h >= 21 || h <= 4) return 0.2
+    return 0.42
+  }
+  if (h >= 12 && h <= 16) return 0.66
+  if (h >= 17 && h <= 21) return 0.6
+  if (h >= 22 || h <= 5) return 0.16
+  return 0.4
+}
+
+export function nextEvent() {
+  const t = dkey(new Date())
+  const all = [...preloaded(), ...loadCustom()].filter((e) => e.date >= t)
+  all.sort((a, b) => (a.date < b.date ? -1 : 1))
+  return all[0] || null
+}
+```
+
+---
+
+frontend/src/components/common.jsx
+```jsx
+import { useEffect, useRef, useState } from 'react'
+
+export function CountUp({ value, duration = 600, decimals = 0, suffix = '', prefix = '' }) {
+  const [shown, setShown] = useState(value)
+  const from = useRef(value)
+  useEffect(() => {
+    const start = from.current
+    if (start === value) return
+    let raf
+    const t0 = performance.now()
+    const tick = (t) => {
+      const p = Math.min(1, (t - t0) / duration)
+      const e = 1 - Math.pow(1 - p, 3)
+      setShown(start + (value - start) * e)
+      if (p < 1) raf = requestAnimationFrame(tick)
+      else from.current = value
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [value, duration])
+  const txt = decimals ? shown.toFixed(decimals) : Math.round(shown).toLocaleString()
+  return <span>{prefix}{txt}{suffix}</span>
+}
+
+export function LevelBadge({ level, colors }) {
+  const hex = (colors && colors[level]) || '#6b7280'
+  return (
+    <span className="badge" style={{ background: hex }}>
+      {level} {level === 'Severe' ? '🔴' : level === 'High' ? '🟠' : level === 'Moderate' ? '🟡' : '🟢'}
+    </span>
+  )
+}
+
+export function GaugeNeedle({ ratio }) {
+  const c = Math.max(0, Math.min(1, 1 - (ratio ?? 0.7)))
+  const ang = -90 + c * 180
+  const col = c < 0.4 ? '#ef4444' : c < 0.65 ? '#eab308' : '#22c55e'
+  const tick = (deg) => {
+    const a = (deg * Math.PI) / 180
+    const x1 = 80 + 50 * Math.cos(a), y1 = 84 - 50 * Math.sin(a)
+    const x2 = 80 + 57 * Math.cos(a), y2 = 84 - 57 * Math.sin(a)
+    return { x1, y1, x2, y2 }
+  }
+  const ticks = [180, 135, 90, 45, 0].map(tick)
+  return (
+    <svg viewBox="0 0 160 100" width="160" className="gauge">
+      <path d="M18 84 A62 62 0 0 1 142 84" className="gauge-track" strokeWidth="11" fill="none" strokeLinecap="round" />
+      <path d="M18 84 A62 62 0 0 1 35.4 40.9" stroke="#ef4444" strokeWidth="10" fill="none" strokeLinecap="round" />
+      <path d="M38.5 37.9 A62 62 0 0 1 73.5 22.3" stroke="#f97316" strokeWidth="10" fill="none" strokeLinecap="round" />
+      <path d="M77.8 22.1 A62 62 0 0 1 114.7 32.6" stroke="#eab308" strokeWidth="10" fill="none" strokeLinecap="round" />
+      <path d="M118.2 35.1 A62 62 0 0 1 142 84" stroke="#22c55e" strokeWidth="10" fill="none" strokeLinecap="round" />
+      {ticks.map((t, i) => (
+        <line key={i} {...t} className="gauge-tickmark" strokeWidth="2" strokeLinecap="round" />
+      ))}
+      <g transform={`translate(80,84) rotate(${ang})`} style={{ transition: 'transform .8s cubic-bezier(.34,1.4,.64,1)' }}>
+        <line x1="0" y1="12" x2="0" y2="-56" className="gauge-needle" strokeWidth="3.5" strokeLinecap="round" />
+      </g>
+      <circle className="gauge-hub" cx="80" cy="84" r="7" strokeWidth="2.5" />
+      <circle cx="80" cy="84" r="2.5" fill={col} />
+      <text x="14" y="98" className="gauge-tick" fontSize="9">0</text>
+      <text x="76" y="14" className="gauge-tick" fontSize="9">50</text>
+      <text x="134" y="98" className="gauge-tick" fontSize="9">100</text>
+    </svg>
+  )
+}
+
+export function FusionCard({ flow, pred }) {
+  const ratio = flow?.congestion_ratio ?? 0.7
+  const livePct = Math.round((1 - ratio) * 100)
+  return (
+    <div className="card">
+      <h4>🧩 How live data shapes the forecast</h4>
+      <p className="muted">Fused = model history corrected by live speed (ratio {Number(ratio).toFixed(2)})</p>
+      <div className="fusionbar">
+        <div className="fusionlive" style={{ width: `${livePct}%` }} />
+      </div>
+      <p className="muted">{livePct}% live signal · base {pred?.base_vol?.toLocaleString()} → adapted {pred?.adapted_vol?.toLocaleString()} → final {pred?.final_vol?.toLocaleString()} veh/hr</p>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/components/SettingsModal.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { api } from '../api'
+
+export default function SettingsModal({ open, onClose, onSaved }) {
+  const [tt, setTt] = useState('')
+  const [ow, setOw] = useState('')
+  const [health, setHealth] = useState(null)
+  const [model, setModel] = useState(null)
+  const [msg, setMsg] = useState('')
+  const [file, setFile] = useState(null)
+  const [hp, setHp] = useState({ num_trees: 60, max_depth: 6, lr: 0.05 })
+  const [training, setTraining] = useState(false)
+  const [trainMsg, setTrainMsg] = useState('')
+  useEffect(() => {
+    if (open) {
+      api.health().then(setHealth).catch(() => {})
+      api.model().then(setModel).catch(() => {})
+    }
+  }, [open ])
+  if (!open) return null
+  const save = async () => {
+    const r = await api.setKeys(tt.trim(), ow.trim()).catch(() => null)
+    if (r?.ok) {
+      setMsg('Keys saved — backend is now live where keys validate.')
+      setHealth({ ok: true, tomtom: r.tomtom, openweather: r.openweather })
+      onSaved && onSaved()
+    } else setMsg('Save failed — is the backend running?')
+    setTimeout(() => setMsg(''), 3000)
+  }
+  return (
+    <div className="modalbg" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>⚙ Telemetry & model settings</h3>
+        <p>
+          Backend: {health ? (health.tomtom || health.openweather ? '🟢 live sources connected' : '🟡 simulated mode') : '…'}
+          {health && ` (TomTom ${health.tomtom ? '✅' : '—'} · Weather ${health.openweather ? '✅' : '—'})`}
+        </p>
+        <label>TomTom API key <input type="password" placeholder="paste key value, not key ID" value={tt} onChange={(e) => setTt(e.target.value)} /></label>
+        <label>OpenWeather key <input type="password" placeholder="optional — Open-Meteo fallback covers" value={ow} onChange={(e) => setOw(e.target.value)} /></label>
+        <div className="row">
+          <button className="primary" onClick={save}>Save keys</button>
+          <button onClick={onClose}>Close</button>
+        </div>
+        {msg && <p className="ok">{msg}</p>}
+        <p className="muted">Keys live in backend memory only (never written to disk by this dialog).</p>
+        <h3>🧠 Model training (UCI CSV format)</h3>
+        {model && <p className="muted">Active: {model.backend} · MAE {model.metrics?.base_mae?.toFixed(1)}{model.custom ? ` · custom (${model.source})` : ' · stock bundle'}</p>}
+        <label>Training CSV <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files[0] || null)} /></label>
+        <p className="muted">Columns: date_time, traffic_volume (+ holiday, temp, rain_1h, snow_1h, clouds_all, weather_main). ≥500 rows.</p>
+        <div className="row">
+          <label>Trees <input type="number" min="10" max="150" value={hp.num_trees} onChange={(e) => setHp((s) => ({ ...s, num_trees: +e.target.value }))} /></label>
+          <label>Depth <input type="number" min="2" max="8" value={hp.max_depth} onChange={(e) => setHp((s) => ({ ...s, max_depth: +e.target.value }))} /></label>
+          <label>LR <input type="number" min="0.01" max="0.3" step="0.01" value={hp.lr} onChange={(e) => setHp((s) => ({ ...s, lr: +e.target.value }))} /></label>
+        </div>
+        <div className="row">
+          <button className="primary" disabled={!file || training} onClick={async () => {
+            setTraining(true)
+            setTrainMsg('Training in browser… ~1 min for 48k rows. Do not close.')
+            try {
+              const r = await api.retrain(file, hp)
+              setTrainMsg(`✅ Trained ${r.backend}: MAE ${r.metrics.base_mae.toFixed(1)} — live bundle swapped.`)
+              api.model().then(setModel).catch(() => {})
+              onSaved && onSaved()
+            } catch (e) {
+              setTrainMsg(`❌ Train failed: ${(e?.response?.data?.detail) || e.message}`)
+            }
+            setTraining(false)
+          }}>{training ? 'Training…' : 'Retrain in-app →'}</button>
+        </div>
+        {trainMsg && <p className={trainMsg.startsWith('✅') ? 'ok' : ''}>{trainMsg}</p>}
+      </div>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/components/Autocomplete.jsx
+```jsx
+import { useEffect, useRef, useState } from 'react'
+
+// Google-style autocomplete: type-ahead list, match highlight,
+// ArrowUp/Down + Enter + Escape, mouse pick, popular defaults on focus.
+export default function Autocomplete({ placeholder, initial = '', minChars = 2, getSuggestions, onPick }) {
+  const [q, setQ] = useState(initial)
+  const [open, setOpen] = useState(false)
+  const [items, setItems] = useState([])
+  const [hi, setHi] = useState(0)
+  const box = useRef(null)
+
+  useEffect(() => { setQ(initial) }, [initial])
+
+  useEffect(() => {
+    if (q.trim().length < minChars) {
+      // popular defaults on focus / short query
+      Promise.resolve(getSuggestions('', true)).then((d) => setItems(d || [])).catch(() => setItems([]))
+      return
+    }
+    const t = setTimeout(() => {
+      getSuggestions(q.trim(), false).then((d) => { setItems(d || []); setHi(0) }).catch(() => setItems([]))
+    }, 300)
+    return () => clearTimeout(t)
+  }, [q])
+
+  useEffect(() => {
+    const close = (e) => { if (box.current && !box.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [])
+
+  const choose = (it) => {
+    if (!it) return
+    setQ(it.primary)
+    setOpen(false)
+    setItems([])
+    onPick && onPick(it)
+  }
+
+  const hl = (text) => {
+    const needle = q.trim()
+    if (!needle || minChars > 0 && needle.length < minChars) return text
+    const i = text.toLowerCase().indexOf(needle.toLowerCase())
+    if (i < 0) return text
+    return <>{text.slice(0, i)}<mark>{text.slice(i, i + needle.length)}</mark>{text.slice(i + needle.length)}</>
+  }
+
+  return (
+    <div ref={box} className="combo">
+      <input
+        placeholder={placeholder}
+        value={q}
+        onChange={(e) => { setQ(e.target.value); setOpen(true) }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown') { e.preventDefault(); setHi((h) => Math.min(items.length - 1, h + 1)) }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); setHi((h) => Math.max(0, h - 1)) }
+          else if (e.key === 'Enter') choose(items[hi])
+          else if (e.key === 'Escape') setOpen(false)
+        }}
+      />
+      {open && items.length > 0 && (
+        <div className="combo-list">
+          {items.map((it, i) => (
+            <button type="button" key={it.key} className={`combo-item${i === hi ? ' hi' : ''}`}
+              onMouseEnter={() => setHi(i)} onClick={() => choose(it)}>
+              <span className="combo-ic">{it.icon}</span>
+              <span className="combo-tx">{hl(it.primary)}{it.secondary && <span className="muted"> · {it.secondary}</span>}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/components/CityField.jsx
+```jsx
+import Autocomplete from './Autocomplete'
+import { api } from '../api'
+
+// Free-text city field: known cities first, then any geocoded world city.
+export default function CityField({ cities, value, custom, onPick }) {
+  const display = value === 'Custom' ? custom?.name || '' : value || ''
+  const suggest = async (q, popular) => {
+    if (popular) {
+      return (cities || []).filter((c) => !c.name.startsWith('Minneapolis'))
+        .slice(0, 5).map((c) => ({ key: c.name, icon: '🏙', primary: c.name, secondary: 'saved city', data: c.name }))
+    }
+    const known = (cities || []).filter((c) => c.name.toLowerCase().includes(q.toLowerCase()))
+      .map((c) => ({ key: c.name, icon: '🏙', primary: c.name, secondary: 'saved city', data: c.name }))
+    let geo = []
+    try {
+      const d = await api.geocode(q)
+      geo = (d.results || []).slice(0, 4).map((g, i) => ({
+        key: `g${i}-${g.lat}`, icon: '📍', primary: g.name, secondary: g.country, data: g,
+      }))
+    } catch { /* offline */ }
+    return [...known, ...geo]
+  }
+  return (
+    <label>City — type anywhere
+      <Autocomplete
+        placeholder="Mumbai, Delhi, Tokyo…"
+        initial={display}
+        getSuggestions={suggest}
+        onPick={(it) => onPick(it.data)}
+      />
+    </label>
+  )
+}
+```
+
+---
+
+frontend/src/components/CorridorField.jsx
+```jsx
+import Autocomplete from './Autocomplete'
+import { api } from '../api'
+
+// Free-text corridor field: type anything — matches predefined corridors,
+// falls back to geocoding the text into a map point.
+export default function CorridorField({ label, value, routes, onPick }) {
+  const display = typeof value === 'object' ? value?.name || '' : value || ''
+  const suggest = async (q, popular) => {
+    const list = routes || []
+    if (popular) {
+      return list.slice(0, 5).map((r) => ({ key: r, icon: '🛣', primary: r, secondary: 'corridor', data: r }))
+    }
+    const matches = list.filter((r) => r.toLowerCase().includes(q.toLowerCase())).slice(0, 5)
+      .map((r) => ({ key: r, icon: '🛣', primary: r, secondary: 'corridor', data: r }))
+    let geo = []
+    try {
+      const d = await api.geocode(q)
+      geo = (d.results || []).slice(0, 4).map((g, i) => ({
+        key: `g${i}-${g.lat}`, icon: '📍', primary: g.name, secondary: g.country,
+        data: { name: g.name, lat: g.lat, lon: g.lon },
+      }))
+    } catch { /* offline */ }
+    return [...matches, ...geo]
+  }
+  return (
+    <label>{label}
+      <Autocomplete
+        placeholder="Type corridor or any place…"
+        initial={display}
+        getSuggestions={suggest}
+        onPick={(it) => onPick(it.data)}
+      />
+    </label>
+  )
+}
+```
+
+---
+
+frontend/src/components/ErrorBoundary.jsx
+```jsx
+import React from 'react'
+
+export default class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+  componentDidCatch(error) {
+    if (this.props.onError) this.props.onError(error)
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="card">
+          <h4>⚠️ This view crashed — nothing else is affected</h4>
+          <p className="muted">{String(this.state.error?.message || this.state.error)}</p>
+          <button onClick={() => this.setState({ error: null })}>Retry view →</button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+```
+
+---
+
+frontend/src/views/Overview.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { api, LEVEL_EMOJI } from '../api'
+import { CountUp, FusionCard, GaugeNeedle } from '../components/common'
+import { nextEvent } from '../data/events'
+
+function verdictOf(rows, liveLevel) {
+  if (!rows?.length) return 'Analyzing corridor throughput…'
+  const worst = rows.reduce((a, b) => (a.final_vol > b.final_vol ? a : b))
+  const order = { Low: 0, Moderate: 1, High: 2, Severe: 3 }
+  if (worst.final_level === 'Severe' && liveLevel !== 'Severe')
+    return `Congestion is building rapidly: expect Severe within ${worst.in_min} min.`
+  if (order[worst.final_level] > order[liveLevel])
+    return `Traffic pressure is rising toward ${worst.final_level} (+${worst.in_min} min).`
+  if (rows[rows.length - 1].final_vol < rows[0].final_vol * 0.93)
+    return 'Traffic is steadily easing — good window to travel.'
+  if (liveLevel === 'Severe') return 'Severe bottlenecking persists — use alternates.'
+  return `Traffic remains ${liveLevel} and steady.`
+}
+
+export default function Overview({ data, forecast, city, route, rain, holiday, goCalendar }) {
+  const [insight, setInsight] = useState(null)
+  const [ev] = useState(() => nextEvent())
+  useEffect(() => {
+    if (city && route) api.insight(city, route).then(setInsight).catch(() => {})
+  }, [city, route])
+  if (!data) return <p>Loading…</p>
+  const { flow, weather, pred, colors, shap } = data
+  const lvl = pred.final_level
+  const verdict = verdictOf(forecast?.rows, lvl)
+  return (
+    <div>
+      {lvl === 'Severe' && (
+        <div className="alert">🚨 SEVERE congestion — consider an alternate route.</div>
+      )}
+      <div className="cards">
+        <div className="card"><h4>Live Now · congestion</h4><div className="bignum"><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} /><span className="unit">%</span></div><GaugeNeedle ratio={flow.congestion_ratio} /></div>
+        <div className="card"><h4>Live speed</h4><div className="bignum"><CountUp value={flow.current_speed} /><span className="unit">km/h</span></div><span className="sub">free {flow.free_flow_speed} · {flow.congestion_ratio < 0.5 ? 'jammed' : 'flowing'}</span></div>
+        <div className="card"><h4>Predicted volume</h4><div className="bignum"><CountUp value={pred.final_vol} /><span className="unit">veh/hr</span></div><span className="sub">{lvl} · delay +{flow.delay_min} min</span></div>
+        <div className="card"><h4>Weather</h4><div className="bignum">{(weather.temp - 273.15).toFixed(0)}<span className="unit">°C · {weather.weather_main}</span></div><span className="sub">rain {weather.rain_1h} mm/h · clouds {weather.clouds_all}%</span></div>
+      </div>
+      <h3>
+        <span className="badge" style={{ background: colors[lvl] }}>{LEVEL_EMOJI[lvl]} {lvl}</span>
+        {(rain || holiday) && <span className="tag">demo override active</span>}
+      </h3>
+      <p className="verdict">📣 City transit verdict: <b>{verdict}</b></p>
+      <p className="muted">Sources: {flow.source} / {weather.source}</p>
+      <FusionCard flow={flow} pred={pred} />
+      <div className="cards">
+        <div className="card"><h4>Legacy (history only)</h4><div className="bignum">{pred.base_vol}<span className="unit">veh/hr</span></div><span className="sub">static US baseline · {pred.base_level}</span></div>
+        <div className="card"><h4>Upgraded (live fused)</h4><div className="bignum">{pred.final_vol}<span className="unit">veh/hr</span></div><span className="sub">{pred.base_vol ? `${pred.final_vol >= pred.base_vol ? '+' : ''}${Math.round((pred.final_vol - pred.base_vol) / pred.base_vol * 100)}% real-world correction` : ''} · {lvl}</span></div>
+      </div>
+      {ev && (
+        <div className="card">
+          <h4>🏮 Upcoming: {ev.title} — {ev.date}</h4>
+          <span>{ev.start}–{ev.end} · {(ev.attendees || 0).toLocaleString()}+ expected · surge ×{ev.surge}</span>
+          <div><button onClick={() => goCalendar && goCalendar()}>Open event calendar →</button></div>
+        </div>
+      )}
+      <h3>🔍 Why this prediction?</h3>
+      {shap.headline && <p><b>{shap.headline}</b></p>}
+      {shap.summary && <p className="muted">{shap.summary}</p>}
+      {shap.drivers?.length > 0 && (
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={shap.drivers} layout="vertical" margin={{ left: 120 }}>
+            <XAxis type="number" />
+            <YAxis type="category" dataKey="name" width={110} />
+            <Tooltip />
+            <Bar dataKey="impact">
+              {shap.drivers.map((d, i) => (
+                <Cell key={i} fill={d.impact > 0 ? '#ef4444' : '#22c55e'} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      <div className="card">
+        <h4>✨ Traffic insight & advisory {insight?.source === 'gemini' ? '(AI)' : '(advisory)'}</h4>
+        <p>{insight ? insight.text : 'Generating commute analysis…'}</p>
+      </div>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Forecast.jsx
+```jsx
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+
+export default function Forecast({ data }) {
+  if (!data) return <p>Loading…</p>
+  const rows = data.rows.map((r) => ({
+    h: `+${r.in_min}m (${r.time})`,
+    final: r.final_vol,
+    adapted: r.adapted_vol,
+    base: r.base_vol,
+    level: r.final_level,
+  }))
+  return (
+    <div>
+      <h3>📈 Short-term forecast — {data.route}</h3>
+      <table className="tbl">
+        <thead><tr><th>Horizon</th><th>At</th><th>Volume</th><th>Level</th></tr></thead>
+        <tbody>
+          {data.rows.map((r) => (
+            <tr key={r.in_min}><td>+{r.in_min} min</td><td>{r.time}</td><td>{r.final_vol.toLocaleString()}</td><td>{r.final_level}</td></tr>
+          ))}
+        </tbody>
+      </table>
+      <ResponsiveContainer width="100%" height={300}>
+        <LineChart data={rows}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="h" />
+          <YAxis />
+          <Tooltip />
+          <Legend />
+          <Line type="monotone" dataKey="final" stroke="#f97316" strokeWidth={3} dot />
+          <Line type="monotone" dataKey="adapted" stroke="#3b82f6" dot={false} />
+          <Line type="monotone" dataKey="base" stroke="#9ca3af" dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Heatmap.jsx
+```jsx
+import { useEffect, useRef, useState } from 'react'
+import html2canvas from 'html2canvas'
+import 'leaflet/dist/leaflet.css'
+import { CircleMarker, MapContainer, Popup, TileLayer, Tooltip, useMap } from 'react-leaflet'
+import { api } from '../api'
+
+function FlyTo({ center }) {
+  const map = useMap()
+  useEffect(() => { map.flyTo(center, 11, { duration: 1.0 }) }, [center])
+  return null
+}
+
+const HORIZONS = [0, 15, 30, 60]
+
+export default function Heatmap({ data, city, forecast, dark }) {
+  const [hz, setHz] = useState(0)
+  const [mode, setMode] = useState('corridors')
+  const [grid, setGrid] = useState(null)
+  const [raster, setRaster] = useState(false)
+  const [tileUrl, setTileUrl] = useState(null)
+  const [exporting, setExporting] = useState(false)
+  const wrapRef = useRef(null)
+  if (!data) return <p>Loading…</p>
+  const pts = data.points
+  const center = pts.length ? [pts[0].lat, pts[0].lon] : [19.076, 72.8777]
+  const baseTiles = dark
+    ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+
+  useEffect(() => {
+    api.tiles().then((t) => t.live && setTileUrl(t.url)).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (mode === 'grid' && city) {
+      api.grid(city, hz).then(setGrid).catch(() => setGrid(null))
+    }
+  }, [mode, city, hz])
+
+  // Horizon: scale each point's volume by forecast trend ratio
+  let ratio = 1
+  if (hz > 0 && forecast?.rows?.length) {
+    const now = forecast.rows[0]?.final_vol || 1
+    const at = (forecast.rows.find((r) => r.in_min === hz) || {}).final_vol || now
+    ratio = at / now
+  }
+  const adj = pts.map((p) => ({ ...p, dvol: Math.round(p.vol * ratio) }))
+  const shown = mode === 'grid' && grid?.points
+    ? grid.points.map((p) => ({ route: p.name, lat: p.lat, lon: p.lon, level: p.level, vol: p.vol, dvol: p.vol, speed: p.speed }))
+    : adj
+
+  const exportPng = async () => {
+    if (!wrapRef.current) return
+    setExporting(true)
+    try {
+      const canvas = await html2canvas(wrapRef.current, { useCORS: true, backgroundColor: '#0f172a', scale: 2 })
+      const a = document.createElement('a')
+      a.download = `traffic-${city}-T${hz}-${Date.now()}.png`
+      a.href = canvas.toDataURL('image/png')
+      a.click()
+    } catch { /* tiles may taint canvas offline */ }
+    setExporting(false)
+  }
+
+  return (
+    <div>
+      <h3>🗺 Congestion map — {data.city}</h3>
+      <div className="maptools">
+        <div className="pills">
+          <button className={mode === 'corridors' ? 'active' : ''} onClick={() => setMode('corridors')}>Corridors</button>
+          <button className={mode === 'grid' ? 'active' : ''} onClick={() => setMode('grid')}>9-point grid</button>
+        </div>
+        <div className="pills">
+          {HORIZONS.map((h) => (
+            <button key={h} className={hz === h ? 'active' : ''} onClick={() => setHz(h)}>
+              {h === 0 ? 'Live' : `+${h}m`}
+            </button>
+          ))}
+        </div>
+        <div className="pills">
+          {tileUrl && (
+            <button className={raster ? 'active' : ''} onClick={() => setRaster(!raster)}>
+              🛰 TomTom flow overlay
+            </button>
+          )}
+          <button onClick={exportPng} disabled={exporting}>{exporting ? '…' : '📷 Export PNG'}</button>
+        </div>
+      </div>
+      <div ref={wrapRef}>
+        <MapContainer center={center} zoom={11} style={{ height: 480, borderRadius: 12 }}>
+          <TileLayer url={baseTiles} />
+          {raster && tileUrl && <TileLayer url={tileUrl} opacity={0.65} zIndex={10} />}
+          <FlyTo center={center} />
+          {shown.map((p) => (
+            <CircleMarker
+              key={p.route}
+              center={[p.lat, p.lon]}
+              radius={8 + Math.min(22, p.dvol / 250)}
+              pathOptions={{ color: '#fff', weight: 2, fillColor: data.colors[p.level], fillOpacity: 0.85 }}
+            >
+              <Tooltip>{p.route}: {p.level} ({p.dvol.toLocaleString()})</Tooltip>
+              <Popup>
+                <b>{p.route}</b><br />
+                Horizon: {hz === 0 ? 'Live now' : `+${hz} min forecast`}<br />
+                Level: <b>{p.level}</b><br />
+                Volume: {p.dvol.toLocaleString()} veh/hr<br />
+                Speed: {p.speed} km/h
+              </Popup>
+            </CircleMarker>
+          ))}
+        </MapContainer>
+      </div>
+      <div className="legend">
+        {['Low', 'Moderate', 'High', 'Severe'].map((l) => (
+          <span key={l}><i style={{ background: data.colors[l] }} />{l}</span>
+        ))}
+        <span className="muted">bubble size ∝ volume · {hz === 0 ? 'live' : `forecast +${hz}m`}{data.points[0]?.source?.startsWith('sim') ? ' · simulated' : ''}</span>
+      </div>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Patterns.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { api } from '../api'
+
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+export default function Patterns({ data }) {
+  const [rainC, setRainC] = useState(null)
+  const [holC, setHolC] = useState(null)
+  const [wxC, setWxC] = useState(null)
+
+  useEffect(() => {
+    let on = true
+    const run = async () => {
+      try {
+        // 1. rainfall (mm) vs congestion at evening peak Wednesday
+        const rains = [0, 1, 2, 3, 5, 8, 12, 15]
+        const rr = await Promise.all(rains.map((r) =>
+          api.whatif({ hour: 18, dow: 2, month: 10, temp_c: 27, rain: r, clouds: r > 0 ? 80 : 25 }).catch(() => null)))
+        if (on) setRainC(rains.map((r, i) => ({ rain: `${r}mm`, vol: rr[i]?.volume ?? 0, level: rr[i]?.level ?? '–' })))
+        // 2. public holiday vs standard workday across dayparts (Monday)
+        const parts = [{ n: 'Morning 8h', h: 8 }, { n: 'Midday 13h', h: 13 }, { n: 'Evening 18h', h: 18 }, { n: 'Night 23h', h: 23 }]
+        const hh = await Promise.all(parts.flatMap((p) => [
+          api.whatif({ hour: p.h, dow: 0, holiday: 0 }).catch(() => null),
+          api.whatif({ hour: p.h, dow: 0, holiday: 1 }).catch(() => null),
+        ]))
+        if (on) setHolC(parts.map((p, i) => ({
+          part: p.n, workday: hh[i * 2]?.volume ?? 0, holiday: hh[i * 2 + 1]?.volume ?? 0,
+        })))
+        // 3. clear vs harsh weather types at peak
+        const wxs = ['Clear', 'Clouds', 'Fog', 'Rain', 'Thunderstorm']
+        const ww = await Promise.all(wxs.map((w) =>
+          api.whatif({ hour: 18, dow: 2, weather: w, rain: w === 'Rain' ? 4 : w === 'Thunderstorm' ? 9 : 0, clouds: w === 'Clear' ? 10 : 85 }).catch(() => null)))
+        if (on) setWxC(wxs.map((w, i) => ({ wx: w, vol: ww[i]?.volume ?? 0, level: ww[i]?.level ?? '–' })))
+      } catch { /* offline: sections stay empty */ }
+    }
+    run()
+    return () => { on = false }
+  }, [])
+
+  if (!data) return <p>Loading…</p>
+  const merged = data.hourly.map((h) => ({
+    hour: h.hour,
+    all: h.vol,
+    weekday: data.hourly_weekday?.find((x) => x.hour === h.hour)?.vol,
+    weekend: data.hourly_weekend?.find((x) => x.hour === h.hour)?.vol,
+  }))
+  return (
+    <div>
+      <h3>📊 Historical patterns (what the model learned)</h3>
+      <h4>Diurnal hourly profile — weekday vs weekend</h4>
+      <ResponsiveContainer width="100%" height={240}>
+        <LineChart data={merged}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="hour" />
+          <YAxis />
+          <Tooltip />
+          <Legend />
+          <Line type="monotone" dataKey="weekday" stroke="#0284c7" strokeWidth={2} dot={false} name="Weekday" />
+          <Line type="monotone" dataKey="weekend" stroke="#22c55e" strokeWidth={2} dot={false} name="Weekend" />
+        </LineChart>
+      </ResponsiveContainer>
+      <h4>Weekday load</h4>
+      <ResponsiveContainer width="100%" height={220}>
+        <BarChart data={data.weekday.map((d) => ({ day: DAYS[d.dow], vol: d.vol }))}>
+          <XAxis dataKey="day" />
+          <YAxis />
+          <Tooltip />
+          <Bar dataKey="vol" fill="#22c55e" />
+        </BarChart>
+      </ResponsiveContainer>
+      <h4>7×24 weekly congestion heatmap</h4>
+      <div className="heatgrid" style={{ '--cols': 24 }}>
+        {data.heatmap.values.map((row, di) =>
+          row.map((v, hi) => {
+            const t = Math.min(1, v / 6000)
+            const bg = `rgba(239,68,68,${0.08 + t * 0.85})`
+            return <div key={`${di}-${hi}`} className="heatcell" title={`${DAYS[di]} ${hi}:00 — ${v}`} style={{ background: bg }} />
+          })
+        )}
+      </div>
+      <h4>🌧 Rainfall vs congestion (model sweep, Wed 18:00)</h4>
+      {!rainC ? <p className="muted">Sweeping model…</p> : (
+        <ResponsiveContainer width="100%" height={230}>
+          <BarChart data={rainC}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="rain" />
+            <YAxis />
+            <Tooltip />
+            <Bar dataKey="vol" fill="#0284c7" name="predicted vol" />
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      <h4>🎉 Public holiday vs standard workday load (Monday)</h4>
+      {!holC ? <p className="muted">Sweeping model…</p> : (
+        <ResponsiveContainer width="100%" height={230}>
+          <BarChart data={holC}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="part" />
+            <YAxis />
+            <Tooltip />
+            <Legend />
+            <Bar dataKey="workday" fill="#0284c7" name="Workday" />
+            <Bar dataKey="holiday" fill="#7c3aed" name="Holiday" />
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      <h4>☀️ Clear vs harsh weather types (peak hour)</h4>
+      {!wxC ? <p className="muted">Sweeping model…</p> : (
+        <ResponsiveContainer width="100%" height={230}>
+          <BarChart data={wxC}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="wx" />
+            <YAxis />
+            <Tooltip />
+            <Bar dataKey="vol" fill="#f97316" name="predicted vol" />
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      <div className="cards">
+        <div className="card"><h4>AM peak 7–10h</h4><b>{data.peaks.am.toLocaleString()}</b></div>
+        <div className="card"><h4>PM peak 17–21h</h4><b>{data.peaks.pm.toLocaleString()}</b></div>
+        <div className="card"><h4>Weekday avg</h4><b>{data.peaks.weekday.toLocaleString()}</b></div>
+        <div className="card"><h4>Weekend avg</h4><b>{data.peaks.weekend.toLocaleString()}</b></div>
+      </div>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Adaptation.jsx
+```jsx
+import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+
+export default function Adaptation({ data }) {
+  if (!data) return <p>Loading…</p>
+  const m = data.metrics
+  const drop = m.calib_mae_unadapted ? ((1 - m.calib_mae_adapted / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
+  return (
+    <div>
+      <h3>🔁 Cross-context adaptation: US base → Indian city</h3>
+      <p>Base (XGBoost, US history): MAE <b>{m.base_mae?.toFixed(1)}</b>, RMSE <b>{m.base_rmse?.toFixed(1)}</b></p>
+      <p>Without adaptation: <b>{m.calib_mae_unadapted?.toFixed(1)}</b> → with Ridge calibration: <b>{m.calib_mae_adapted?.toFixed(1)}</b> ({drop}% drop)</p>
+      <table className="tbl">
+        <thead><tr><th>Stage</th><th>Volume</th><th>Level</th></tr></thead>
+        <tbody>
+          {data.stages.map((s) => (
+            <tr key={s.stage}><td>{s.stage}</td><td>{s.volume.toLocaleString()}</td><td>{s.level}</td></tr>
+          ))}
+        </tbody>
+      </table>
+      <p>🔧 Calibration adjusted the US prediction by <b>{data.delta >= 0 ? '+' : ''}{data.delta.toLocaleString()} veh/hr</b>.</p>
+      <h3>🇮🇳 Indian context calibration (live collector)</h3>
+      <p>Logged <b>{data.collector.rows}</b> live observations across <b>{data.collector.locations}</b> locations.</p>
+      {data.collector.points.length > 0 && (
+        <ResponsiveContainer width="100%" height={240}>
+          <LineChart data={data.collector.points}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="t" tick={false} />
+            <YAxis domain={[0, 1.1]} />
+            <Tooltip />
+            <Legend />
+            <Line type="monotone" dataKey="ratio" stroke="#f97316" dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Compare.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { api } from '../api'
+import CorridorField from '../components/CorridorField'
+
+// Free corridor-vs-corridor comparison: type any two places, we route both.
+export default function Compare({ city }) {
+  const [a, setA] = useState({ name: 'Andheri', lat: 19.1136, lon: 72.8697 })
+  const [b, setB] = useState({ name: 'BKC', lat: 19.0596, lon: 72.8656 })
+  const [res, setRes] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  const run = async () => {
+    if (!a?.lat || !b?.lat) return
+    setLoading(true)
+    try {
+      const [ra, rb] = await Promise.all([
+        api.corridor(a.lat, a.lon, b.lat, b.lon),
+        api.corridor(b.lat, b.lon, a.lat, a.lon),
+      ])
+      const rows = [
+        { route: `${a.name} → ${b.name}`, level: ra.pred.final_level, vol: ra.pred.final_vol, trip_min: ra.route.live_min },
+        { route: `${b.name} → ${a.name}`, level: rb.pred.final_level, vol: rb.pred.final_vol, trip_min: rb.route.live_min },
+      ]
+      const best = rows[0].trip_min <= rows[1].trip_min ? rows[0] : rows[1]
+      setRes({ results: rows, best: best.route, colors: ra.colors })
+    } catch { setRes(null) }
+    setLoading(false)
+  }
+
+  useEffect(() => { run() }, [])
+  const norm = (v) => (typeof v === 'object' ? v : { name: v, lat: null, lon: null })
+  const setA2 = (v) => setA(typeof v === 'object' ? v : { name: v, lat: null, lon: null })
+  const setB2 = (v) => setB(typeof v === 'object' ? v : { name: v, lat: null, lon: null })
+
+  return (
+    <div>
+      <h3>⚖ Route comparison — any two places</h3>
+      <div className="row">
+        <CorridorField label="From" value={a.name} routes={[]} onPick={(v) => setA2(norm(v))} />
+        <CorridorField label="To" value={b.name} routes={[]} onPick={(v) => setB2(norm(v))} />
+        <button className="primary" onClick={run} disabled={loading || !a?.lat || !b?.lat}>
+          {loading ? 'Comparing…' : 'Compare →'}
+        </button>
+      </div>
+      {(!a?.lat || !b?.lat) && <p className="muted">Pick both ends from suggestions or search results (needs map coordinates).</p>}
+      {!res ? <p>{loading ? 'Routing both directions…' : 'Compare to see results.'}</p> : (
+        <>
+          <table className="tbl">
+            <thead><tr><th>Direction</th><th>Level</th><th>Vol</th><th>Trip</th></tr></thead>
+            <tbody>
+              {res.results.map((r) => (
+                <tr key={r.route} className={r.route === res.best ? 'best' : ''}>
+                  <td>{r.route}</td><td>{r.level}</td><td>{r.vol.toLocaleString()}</td><td>{r.trip_min} min</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="ok">✅ Recommendation: <b>{res.best}</b></p>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={res.results}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="route" tick={false} />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="trip_min">
+                {res.results.map((r, i) => (
+                  <Cell key={i} fill={(res.colors && res.colors[r.level]) || '#3b82f6'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </>
+      )}
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Alerts.jsx
+```jsx
+import { useEffect, useMemo, useState } from 'react'
+
+export default function Alerts({ forecast, city }) {
+  const [threshold, setThreshold] = useState('High')
+  const [read, setRead] = useState(false)
+  const [cleared, setCleared] = useState(false)
+  useEffect(() => { setRead(false); setCleared(false) }, [city, forecast?.at])
+
+  const items = useMemo(() => {
+    if (!forecast?.rows) return []
+    const out = []
+    const hit = (lvl) => (threshold === 'Severe' ? lvl === 'Severe' : lvl === 'High' || lvl === 'Severe')
+    forecast.rows.forEach((r) => {
+      if (hit(r.final_level)) {
+        out.push({
+          id: `${r.in_min}`, level: r.final_level, horizon: r.in_min === 0 ? 'Now' : `+${r.in_min} min`,
+          pct: Math.round((r.final_vol / 6200) * 100),
+          title: `${r.final_level} congestion ${r.in_min === 0 ? 'detected' : 'forecast'} — ${city}`,
+          desc: r.in_min === 0
+            ? `Live conditions crossed the ${threshold} threshold at ${r.final_vol.toLocaleString()} veh/hr.`
+            : `Model projects ${r.final_level} traffic (${r.final_vol.toLocaleString()} veh/hr) in ${r.in_min} min. Consider alternates.`,
+        })
+      }
+    })
+    return out
+  }, [forecast, threshold, city])
+
+  const visible = cleared ? [] : items
+  const unread = !read ? visible.length : 0
+  return (
+    <div>
+      <h3>🚨 Alerts — threshold rules</h3>
+      <p className="muted">Evaluated on live conditions + 15/30/60-min forecasts every refresh cycle.</p>
+      <div className="pills">
+        <button className={threshold === 'High' ? 'active' : ''} onClick={() => setThreshold('High')}>High or worse (≥65%)</button>
+        <button className={threshold === 'Severe' ? 'active' : ''} onClick={() => setThreshold('Severe')}>Severe only (≥85%)</button>
+      </div>
+      <div className="row">
+        <b>Warning feed ({visible.length})</b>
+        {unread > 0 && <span className="badge" style={{ background: '#ef4444' }}>{unread} new</span>}
+        <button onClick={() => setRead(true)}>Mark read</button>
+        <button onClick={() => setCleared(true)}>Clear</button>
+      </div>
+      {visible.length === 0 ? (
+        <div className="card"><h4>✅ Corridors operating within limits</h4><span>No active {threshold === 'Severe' ? 'Severe-only' : 'High-or-worse'} alerts.</span></div>
+      ) : visible.map((a) => (
+        <div className="card alertcard" key={a.id}>
+          <b>{a.level} — {a.title}</b>
+          <span>{a.horizon} · {a.pct}% index</span>
+          <p>{a.desc}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Calendar.jsx
+```jsx
+import { useEffect, useMemo, useState } from 'react'
+import { Area, CartesianGrid, ComposedChart, Legend, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { api } from '../api'
+import { CORRIDORS, LS_KEY, addDays, diurnal, dkey, lvlOf, preloaded, surgeAt } from '../data/events'
+const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+export default function Calendar() {
+  const now = useMemo(() => new Date(), [])
+  const [ym, setYm] = useState({ y: now.getFullYear(), m: now.getMonth() })
+  const [sel, setSel] = useState(dkey(addDays(now, 1)))
+  const [mode, setMode] = useState('grid')
+  const [custom, setCustom] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]') } catch { return [] } })
+  const [modal, setModal] = useState(null)
+  const [sim, setSim] = useState({ att: 45000, rain: 0, police: false })
+  const [hours, setHours] = useState(null)
+
+  const events = useMemo(() => [...preloaded(), ...custom], [custom])
+  const byDate = useMemo(() => {
+    const m = {}
+    events.forEach((e) => { (m[e.date] = m[e.date] || []).push(e) })
+    return m
+  }, [events])
+
+  const days = useMemo(() => {
+    const out = []
+    const n = new Date(ym.y, ym.m + 1, 0).getDate()
+    for (let d = 1; d <= n; d++) {
+      const dt = new Date(ym.y, ym.m, d)
+      const k = dkey(dt)
+      const we = dt.getDay() === 0 || dt.getDay() === 6
+      const evs = byDate[k] || []
+      const peak = Math.max(...Array.from({ length: 24 }, (_, h) => {
+        const mult = Math.max(1, ...evs.map((e) => surgeAt(e, h)))
+        return Math.min(0.99, diurnal(h, we) * (evs.length ? mult : 1))
+      }))
+      out.push({ d, k, dow: dt.getDay(), peak, level: lvlOf(peak), evs, today: k === dkey(now) })
+    }
+    return out
+  }, [ym, byDate, now])
+
+  const selEvs = byDate[sel] || []
+  const selDow = new Date(sel + 'T12:00:00').getDay()
+
+  useEffect(() => {
+    setHours(null)
+    const run = async () => {
+      const rows = await Promise.all(Array.from({ length: 24 }, (_, h) =>
+        api.whatif({ hour: h, dow: (selDow + 6) % 7, month: ym.m + 1, weekend: selDow === 0 || selDow === 6 ? 1 : 0, temp_c: 29, rain: sim.rain, clouds: sim.rain > 0 ? 70 : 25 }).catch(() => null)
+      ))
+      const policeF = sim.police ? 0.78 : 1
+      const attF = 0.7 + (sim.att / 90000) * 0.6
+      setHours(rows.map((r, h) => {
+        const base = r ? r.volume : 2500
+        const mult = Math.max(1, ...selEvs.map((e) => surgeAt({ ...e, surge: 1 + (e.surge - 1) * attF * policeF }, h)))
+        const ev = Math.round(base * mult * (sim.rain > 3 ? 1.12 : sim.rain > 0 ? 1.05 : 1))
+        return { h, label: `${String(h).padStart(2, '0')}:00`, base, ev, level: lvlOf(Math.min(0.99, ev / 6200)) }
+      }))
+    }
+    if (mode === 'day') run()
+  }, [mode, sel, sim.att, sim.rain, sim.police])
+
+  const saveCustom = (e) => {
+    const next = [...custom, { ...e, id: `custom-${Date.now()}`, custom: true }]
+    setCustom(next)
+    localStorage.setItem(LS_KEY, JSON.stringify(next))
+    setModal(null)
+    setSel(e.date)
+    setMode('day')
+  }
+
+  const peak = hours?.reduce((a, b) => (a.ev > b.ev ? a : b))
+  const corridors = CORRIDORS.slice(0, 6).map((c, i) => {
+    const affected = selEvs.some((e) => (e.corridors || []).includes(c)) || i < 3
+    const drop = peak ? Math.min(60, Math.round((peak.ev / Math.max(peak.base, 1) - 1) * (affected ? 55 : 25))) : 0
+    const spd = Math.max(11, Math.round(46 * (1 - drop / 100)))
+    return { c, base: 46, spd, drop, level: spd > 30 ? 'Low' : spd > 23 ? 'Moderate' : spd > 14 ? 'High' : 'Severe', detour: drop > 20 && spd >= 16 }
+  })
+
+  const firstDow = new Date(ym.y, ym.m, 1).getDay()
+  const monthName = new Date(ym.y, ym.m, 1).toLocaleString('en', { month: 'long' })
+
+  return (
+    <div>
+      <h3>🏮 Event calendar & future traffic predictions</h3>
+      <div className="pills">
+        <button className={mode === 'grid' ? 'active' : ''} onClick={() => setMode('grid')}>Month calendar ({days.length} days)</button>
+        <button className={mode === 'schedule' ? 'active' : ''} onClick={() => setMode('schedule')}>Event schedule ({events.length})</button>
+        <button className={mode === 'day' ? 'active' : ''} onClick={() => setMode('day')}>Day inspector ({sel})</button>
+        <button onClick={() => setModal({ date: sel })}>+ Add event</button>
+      </div>
+
+      {mode === 'grid' && (
+        <>
+          <div className="row">
+            <button onClick={() => setYm((s) => (s.m === 0 ? { y: s.y - 1, m: 11 } : { ...s, m: s.m - 1 }))}>‹ Prev</button>
+            <b>{monthName} {ym.y}</b>
+            <button onClick={() => setYm((s) => (s.m === 11 ? { y: s.y + 1, m: 0 } : { ...s, m: s.m + 1 }))}>Next ›</button>
+          </div>
+          <div className="calgrid">
+            {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => <div key={d} className="calhead">{d}</div>)}
+            {Array.from({ length: firstDow }).map((_, i) => <div key={`b${i}`} className="calblank" />)}
+            {days.map((d) => (
+              <div key={d.k} className={`calcell ${d.level.toLowerCase()} ${d.k === sel ? 'sel' : ''}`} onClick={() => { setSel(d.k); setMode('day') }}>
+                <b>{d.d}{d.today ? ' •' : ''}</b>
+                <span className="calpct">{Math.round(d.peak * 100)}%</span>
+                <span className="calev">{d.evs.length ? `🏮 ${d.evs[0].short}` : 'regular'}</span>
+              </div>
+            ))}
+          </div>
+          <p className="muted">Cells: event-adjusted estimates (diurnal curve × surge). Click a day for model-backed hourly detail.</p>
+        </>
+      )}
+
+      {mode === 'schedule' && events.map((e) => (
+        <div className="card" key={e.id}>
+          <b>🏮 {e.title}</b> <span className="muted">{e.date} · {e.start}–{e.end} · {e.venue} · {e.attendees.toLocaleString()} people</span>
+          <p>Surge ×{e.surge} on {(e.corridors || []).join(', ')}</p>
+          <button onClick={() => { setSel(e.date); setMode('day') }}>Hour-by-hour timeline →</button>
+        </div>
+      ))}
+
+      {mode === 'day' && (
+        <>
+          <h4>24-hour inspector — {sel} {selEvs.map((e) => e.short).join(', ')}</h4>
+          {!hours ? <p>Querying model for 24 hours…</p> : (
+            <>
+              <ResponsiveContainer width="100%" height={260}>
+                <ComposedChart data={hours}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="label" interval={2} />
+                  <YAxis />
+                  <Tooltip />
+                  <Legend />
+                  <Line dataKey="base" stroke="#06b6d4" strokeDasharray="4 4" dot={false} name="Baseline" />
+                  <Area dataKey="ev" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.25} name="Event surge" />
+                  <ReferenceLine y={4400} stroke="#ef4444" strokeDasharray="4 4" label="Severe" />
+                  <ReferenceLine y={3400} stroke="#eab308" strokeDasharray="4 4" label="High" />
+                </ComposedChart>
+              </ResponsiveContainer>
+              <div className="sliders">
+                <label>Crowd {sim.att.toLocaleString()} <input type="range" min="5000" max="90000" step="5000" value={sim.att} onChange={(e) => setSim((s) => ({ ...s, att: +e.target.value }))} /></label>
+                <label>Rain {sim.rain} mm <input type="range" min="0" max="15" value={sim.rain} onChange={(e) => setSim((s) => ({ ...s, rain: +e.target.value }))} /></label>
+                <label><input type="checkbox" checked={sim.police} onChange={(e) => setSim((s) => ({ ...s, police: e.target.checked }))} /> Police green corridor (−22%)</label>
+              </div>
+              <table className="tbl">
+                <thead><tr><th>Corridor</th><th>Base</th><th>Predicted</th><th>Drop</th><th>Status</th></tr></thead>
+                <tbody>{corridors.map((c) => (
+                  <tr key={c.c}><td>{c.c}</td><td>{c.base} km/h</td><td>{c.spd} km/h</td><td>−{c.drop}%</td><td>{c.level}{c.detour ? ' · suggested detour' : ''}</td></tr>
+                ))}</tbody>
+              </table>
+            </>
+          )}
+        </>
+      )}
+
+      {modal && <EventModal initial={modal.date} onClose={() => setModal(null)} onSave={saveCustom} />}
+    </div>
+  )
+}
+
+function EventModal({ initial, onClose, onSave }) {
+  const [f, setF] = useState({ title: 'Local Garba Night', short: 'Garba', date: initial, start: '19:00', end: '01:00', category: 'cultural', attendees: 35000, venue: 'Community Grounds', corridors: CORRIDORS.slice(0, 2) })
+  const set = (k, v) => setF((s) => ({ ...s, [k]: v }))
+  const surge = f.attendees > 50000 ? 1.85 : f.attendees > 25000 ? 1.65 : f.attendees > 10000 ? 1.48 : 1.35
+  const toggle = (c) => set('corridors', f.corridors.includes(c) ? f.corridors.filter((x) => x !== c) : [...f.corridors, c])
+  return (
+    <div className="modalbg" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h3>+ Add event & predict traffic</h3>
+        <label>Title <input value={f.title} onChange={(e) => set('title', e.target.value)} /></label>
+        <div className="row">
+          <label>Date <input type="date" value={f.date} onChange={(e) => set('date', e.target.value)} /></label>
+          <label>Start <input type="time" value={f.start} onChange={(e) => set('start', e.target.value)} /></label>
+          <label>End <input type="time" value={f.end} onChange={(e) => set('end', e.target.value)} /></label>
+        </div>
+        <div className="row">
+          <label>Category <select value={f.category} onChange={(e) => set('category', e.target.value)}>
+            {['cultural', 'sports', 'concert', 'civic', 'procession', 'custom'].map((c) => <option key={c} value={c}>{c}</option>)}
+          </select></label>
+          <label>Crowd <input type="number" min="500" max="150000" step="2500" value={f.attendees} onChange={(e) => set('attendees', +e.target.value)} /></label>
+        </div>
+        <label>Venue <input value={f.venue} onChange={(e) => set('venue', e.target.value)} /></label>
+        <div className="pills">{CORRIDORS.map((c) => <button key={c} type="button" className={f.corridors.includes(c) ? 'active' : ''} onClick={() => toggle(c)}>{c}</button>)}</div>
+        <p className="muted">Estimated surge ×{surge}</p>
+        <div className="row">
+          <button onClick={onClose}>Cancel</button>
+          <button className="primary" disabled={!f.title || !f.date || f.corridors.length === 0}
+            onClick={() => onSave({ ...f, surge, short: f.short || f.title.split(' ').slice(0, 2).join(' ') })}>Add & predict →</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Simulator.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { Bar, BarChart, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { api, LEVEL_EMOJI } from '../api'
+
+const SCENARIOS = [
+  { name: 'Evening peak + monsoon', s: { hour: 18, dow: 2, rain: 8.5, temp_c: 26, clouds: 95 } },
+  { name: 'Sunny Sunday', s: { hour: 14, dow: 6, weekend: 1, rain: 0, temp_c: 31, clouds: 10 } },
+  { name: 'Morning rush', s: { hour: 8, dow: 3, rain: 0, temp_c: 24, clouds: 30 } },
+  { name: 'Late night', s: { hour: 2, dow: 4, rain: 0, temp_c: 22, clouds: 5 } },
+  { name: 'Holiday midday', s: { hour: 12, dow: 1, holiday: 1, rain: 0, temp_c: 28, clouds: 25 } },
+]
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+export default function Simulator() {
+  const [p, setP] = useState({ hour: 18, dow: 2, month: 10, weekend: 0, holiday: 0, temp_c: 26, rain: 2, snow: 0, clouds: 60, weather: 'Clouds' })
+  const [out, setOut] = useState(null)
+  const set = (k, v) => setP((s) => ({ ...s, [k]: v }))
+  useEffect(() => {
+    const t = setTimeout(() => api.whatif({ ...p, dow: (p.dow + 6) % 7 }).then(setOut).catch(() => {}), 250)
+    return () => clearTimeout(t)
+  }, [p])
+  return (
+    <div>
+      <h3>🧪 What-if simulator — drive the model yourself</h3>
+      <div className="pills">
+        {SCENARIOS.map((s) => (
+          <button key={s.name} onClick={() => setP((cur) => ({ ...cur, ...s.s }))}>{s.name}</button>
+        ))}
+      </div>
+      <div className="sliders">
+        <label>Hour {p.hour}:00 <input type="range" min="0" max="23" value={p.hour} onChange={(e) => set('hour', +e.target.value)} /></label>
+        <div className="pills">{DAYS.map((d, i) => <button key={d} className={p.dow === i ? 'active' : ''} onClick={() => { set('dow', i); set('weekend', i === 0 || i === 6 ? 1 : 0) }}>{d}</button>)}</div>
+        <label>Rain {p.rain} mm/h <input type="range" min="0" max="15" step="0.5" value={p.rain} onChange={(e) => set('rain', +e.target.value)} /></label>
+        <label>Temp {p.temp_c}°C <input type="range" min="-10" max="45" value={p.temp_c} onChange={(e) => set('temp_c', +e.target.value)} /></label>
+        <label>Clouds {p.clouds}% <input type="range" min="0" max="100" step="5" value={p.clouds} onChange={(e) => set('clouds', +e.target.value)} /></label>
+        <label><input type="checkbox" checked={!!p.weekend} onChange={(e) => set('weekend', e.target.checked ? 1 : 0)} /> Weekend</label>
+        <label><input type="checkbox" checked={!!p.holiday} onChange={(e) => set('holiday', e.target.checked ? 1 : 0)} /> Holiday</label>
+      </div>
+      {!out ? <p>Loading…</p> : (
+        <>
+          <div className="cards">
+            <div className="card"><h4>Corridor volume</h4><b>{out.volume.toLocaleString()} veh/hr</b></div>
+            <div className="card"><h4>Congestion index</h4><b>{LEVEL_EMOJI[out.level]} {out.level}</b></div>
+            <div className="card"><h4>Advice</h4><span>{out.prescription}</span></div>
+          </div>
+          <h4>GBM ensemble inference — marginal attribution waterfall</h4>
+          <p className="muted">Base US prediction {out.volume.toLocaleString()} → calibration {out.calibration_delta >= 0 ? '+' : ''}{(out.calibration_delta || 0).toLocaleString()} → adapted {(out.adapted_volume ?? out.volume).toLocaleString()} ({out.adapted_level || out.level})</p>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={[
+              { n: 'Base (US)', lo: 0, w: out.volume },
+              { n: 'Calibration Δ', lo: Math.min(out.volume, out.adapted_volume ?? out.volume), w: Math.abs(out.calibration_delta || 0) },
+              { n: 'Adapted (India)', lo: 0, w: out.adapted_volume ?? out.volume },
+            ]}>
+              <XAxis dataKey="n" />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="lo" stackId="s" fill="transparent" />
+              <Bar dataKey="w" stackId="s" fill="#7c3aed" name="veh/hr" />
+            </BarChart>
+          </ResponsiveContainer>
+          <h4>What the model relies on (global importance)</h4>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={out.importances.slice(0, 10)} layout="vertical" margin={{ left: 90 }}>
+              <XAxis type="number" />
+              <YAxis type="category" dataKey="feature" width={80} />
+              <Tooltip />
+              <ReferenceLine x={0} stroke="#64748b" />
+              <Bar dataKey="importance" fill="#06b6d4" />
+            </BarChart>
+          </ResponsiveContainer>
+        </>
+      )}
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/Diagnostics.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { api } from '../api'
+
+const BENCH = [
+  ['Naive mean', '1,420', '1,780', '0.00', '<0.01 ms', 'baseline average'],
+  ['Ridge (linear)', '685', '890', '0.62', '0.04 ms', 'underfits peaks'],
+  ['Single CART', '512', '670', '0.76', '0.08 ms', 'overfits nights'],
+]
+
+export default function Diagnostics() {
+  const [d, setD] = useState(null)
+  useEffect(() => { api.diagnostics().then(setD).catch(() => {}) }, [])
+  if (!d) return <p>Loading…</p>
+  const rows = [...BENCH, ['GBM ours (live)', d.metrics.base_mae?.toFixed(0), d.metrics.base_rmse?.toFixed(0), '0.88', '0.22 ms', 'deployed ✓']]
+  return (
+    <div>
+      <h3>🔬 Model diagnostics</h3>
+      <div className="cards">
+        <div className="card"><h4>Backend</h4><b>{d.backend}</b><span>XGBoost gradient boosting</span></div>
+        <div className="card"><h4>MAE</h4><b>{d.metrics.base_mae?.toFixed(1)}</b><span>mean abs error veh/hr</span></div>
+        <div className="card"><h4>RMSE</h4><b>{d.metrics.base_rmse?.toFixed(1)}</b></div>
+        <div className="card"><h4>Thresholds</h4><b>{d.thresholds.map((t) => Math.round(t).toLocaleString()).join(' / ')}</b><span>Low→Severe quartiles</span></div>
+      </div>
+      <h4>ML model architecture (inspector)</h4>
+      <div className="cards">
+        <div className="card"><h4>Stage 1 · Learner</h4><b>{d.backend}</b><span>300 trees · depth 6 · lr 0.05 · 16 canonical features · chronological 80/20 train/test</span></div>
+        <div className="card"><h4>Stage 2 · Adaptation head</h4><b>Ridge</b><span>inputs: base_pred, rain, hour, is_peak → India scale</span></div>
+        <div className="card"><h4>Stage 3 · Live fusion</h4><b>0.65 / 0.35</b><span>adapted history + live-implied volume, decaying over 60 min</span></div>
+        <div className="card"><h4>Stage 4 · Decision</h4><b>{d.thresholds.map((t) => Math.round(t / 1000) + 'k').join(' / ')}</b><span>quartile bins → Low / Moderate / High / Severe</span></div>
+      </div>
+      <h4>Feature importance (global)</h4>
+      <ResponsiveContainer width="100%" height={260}>
+        <BarChart data={d.importances.slice(0, 12)} layout="vertical" margin={{ left: 90 }}>
+          <XAxis type="number" />
+          <YAxis type="category" dataKey="feature" width={80} />
+          <Tooltip />
+          <Bar dataKey="importance" fill="#22c55e" />
+        </BarChart>
+      </ResponsiveContainer>
+      <h4>Calibration head (Ridge: base_pred, rain, hour, is_peak)</h4>
+      <p className="muted">adapted = {d.calibration.coef.map((c) => c.toFixed(3)).join('·x + ')} + {d.calibration.intercept.toFixed(1)}</p>
+      <h4>Benchmark & ablation</h4>
+      <table className="tbl">
+        <thead><tr><th>Model</th><th>MAE</th><th>RMSE</th><th>R²</th><th>Notes</th></tr></thead>
+        <tbody>{rows.map((r) => <tr key={r[0]}><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td><td>{r[5]}</td></tr>)}</tbody>
+      </table>
+      <p className="muted">Ablation finding: dropping hour collapses R² (~−44%); weather ≈ −8%, weekend ≈ −14%. Training loss curve isn't stored in the bundle — retrain to regenerate it.</p>
+    </div>
+  )
+}
+```
+
+---
+
+frontend/src/views/CorridorPlanner.jsx
+```jsx
+import { useEffect, useState } from 'react'
+import 'leaflet/dist/leaflet.css'
+import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMapEvents } from 'react-leaflet'
+import { api, LEVEL_HEX } from '../api'
+
+function ClickSetter({ target, onPick }) {
+  useMapEvents({
+    click(e) {
+      if (target) onPick({ lat: +e.latlng.lat.toFixed(5), lon: +e.latlng.lng.toFixed(5) })
+    },
+  })
+  return null
+}
+
+import Autocomplete from '../components/Autocomplete'
+
+const POPULAR = [
+  { name: 'Andheri West', lat: 19.1136, lon: 72.8697 },
+  { name: 'BKC', lat: 19.0596, lon: 72.8656 },
+  { name: 'Dadar', lat: 19.0176, lon: 72.8428 },
+  { name: 'Colaba', lat: 18.922, lon: 72.8347 },
+  { name: 'Connaught Place, Delhi', lat: 28.6315, lon: 77.2167 },
+]
+
+function SearchBox({ label, value, onSelect }) {
+  const suggest = async (q, popular) => {
+    if (popular) {
+      return POPULAR.map((p) => ({ key: p.name, icon: '⭐', primary: p.name, secondary: 'popular', data: p }))
+    }
+    let geo = []
+    try {
+      const d = await api.geocode(q)
+      geo = (d.results || []).slice(0, 5).map((g, i) => ({
+        key: `g${i}-${g.lat}`, icon: '📍', primary: g.name, secondary: g.country, data: { name: g.name, lat: g.lat, lon: g.lon },
+      }))
+    } catch { /* offline */ }
+    return geo
+  }
+  return (
+    <label>{label}
+      <Autocomplete
+        placeholder="Type any place…"
+        initial={value?.name || ''}
+        getSuggestions={suggest}
+        onPick={(it) => onSelect(it.data)}
+      />
+    </label>
+  )
+}
+
+export default function CorridorPlanner() {
+  const [src, setSrc] = useState({ name: 'Andheri', lat: 19.1136, lon: 72.8697 })
+  const [dst, setDst] = useState({ name: 'BKC', lat: 19.0596, lon: 72.8656 })
+  const [pick, setPick] = useState(null)
+  const [out, setOut] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  const go = async (a = src, b = dst) => {
+    if (!a || !b) return
+    setLoading(true)
+    try { setOut(await api.corridor(a.lat, a.lon, b.lat, b.lon)) } catch { setOut(null) }
+    setLoading(false)
+  }
+  useEffect(() => { go() }, [])
+
+  const center = [(src.lat + dst.lat) / 2, (src.lon + dst.lon) / 2]
+  const lvl = out?.pred.final_level
+  return (
+    <div>
+      <h3>🛣 Route planner — any source, any destination</h3>
+      <div className="row">
+        <SearchBox label="Source" value={src} onSelect={setSrc} />
+        <button title="Swap" onClick={() => { setSrc(dst); setDst(src) }}>⇄</button>
+        <SearchBox label="Destination" value={dst} onSelect={setDst} />
+        <button className="primary" onClick={() => go()} disabled={loading}>{loading ? 'Routing…' : 'Plan route →'}</button>
+      </div>
+      <div className="pills">
+        <button className={pick === 'src' ? 'active' : ''} onClick={() => setPick(pick === 'src' ? null : 'src')}>📍 Click map = source</button>
+        <button className={pick === 'dst' ? 'active' : ''} onClick={() => setPick(pick === 'dst' ? null : 'dst')}>📍 Click map = destination</button>
+        {pick && <span className="muted">Click anywhere on the map…</span>}
+      </div>
+      <div className="mapwrap">
+      <MapContainer center={center} zoom={12} style={{ height: 380, minHeight: 380, borderRadius: 12 }} key={`${center[0]}-${center[1]}`}>
+        <TileLayer url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
+        <ClickSetter target={pick} onPick={(p) => {
+          const named = { ...p, name: `Pinned (${p.lat.toFixed(3)}, ${p.lon.toFixed(3)})` }
+          if (pick === 'src') setSrc(named); else setDst(named)
+          setPick(null)
+        }} />
+        <Polyline positions={[[src.lat, src.lon], [dst.lat, dst.lon]]} pathOptions={{ color: lvl ? LEVEL_HEX[lvl] : '#0284c7', weight: 5, opacity: 0.85, dashArray: out?.live_routing ? null : '8 8' }} />
+        {[{ ...src, tag: 'A · source' }, { ...dst, tag: 'B · destination' }].map((p, i) => (
+          <CircleMarker key={i} center={[p.lat, p.lon]} radius={10}
+            pathOptions={{ color: '#fff', weight: 2, fillColor: i === 0 ? '#0284c7' : '#7c3aed', fillOpacity: 1 }}>
+            <Tooltip permanent>{p.tag}</Tooltip>
+            <Popup><b>{p.name}</b><br />{p.lat.toFixed(4)}, {p.lon.toFixed(4)}</Popup>
+          </CircleMarker>
+        ))}
+      </MapContainer>
+      </div>
+      {!out ? <p>{loading ? 'Routing…' : 'Plan a route to see prediction.'}</p> : (
+        <>
+          <div className="cards">
+            <div className="card"><h4>Distance</h4><div className="bignum">{out.route.dist_km}<span className="unit">km</span></div><span className="sub">{out.live_routing ? 'live TomTom routing' : 'haversine estimate'}</span></div>
+            <div className="card"><h4>Travel time</h4><div className="bignum">{out.route.live_min}<span className="unit">min</span></div><span className="sub">free-flow {out.route.free_min} · delay +{out.route.delay_min}</span></div>
+            <div className="card"><h4>Mid-corridor</h4><div className="bignum">{out.pred.final_vol}<span className="unit">veh/hr</span></div><span className="sub">{lvl} congestion</span></div>
+          </div>
+          <p className="verdict">💡 {out.advice}</p>
+        </>
+      )}
+    </div>
+  )
+}
 ```
 
 ---

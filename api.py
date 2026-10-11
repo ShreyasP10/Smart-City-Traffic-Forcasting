@@ -10,7 +10,7 @@ import json
 import os
 
 import joblib  # noqa: F401 (kept for safe_load_model internals)
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from city_config import CITIES
@@ -61,6 +61,7 @@ def ow_key() -> str:
 
 _bundle = None
 _data = None
+_bundle_meta = {"custom": False, "trained_at": None, "source": "models/traffic_model.joblib"}
 
 
 def bundle():
@@ -92,11 +93,11 @@ def _route(city: str, route: str) -> dict:
 
 
 def _live(city: str, route: dict, at: dt.datetime, rain_override: bool = False,
-          holiday_override: bool = False):
+          rain_mm: float = 0.0, holiday_override: bool = False):
     b = bundle()
     weather = fetch_openweather(route["lat"], route["lon"], ow_key() or None)
-    if rain_override:
-        weather["rain_1h"] = max(float(weather.get("rain_1h", 0)), 3.5)
+    if rain_override or rain_mm > 0:
+        weather["rain_1h"] = max(float(weather.get("rain_1h", 0)), float(rain_mm) if rain_mm > 0 else 3.5)
         if weather.get("weather_main") == "Clear":
             weather["weather_main"] = "Rain"
     if holiday_override:
@@ -187,16 +188,25 @@ def thresholds():
     return {"thresholds": [float(x) for x in b["thresholds"]], "metrics": b.get("metrics", {})}
 
 
-@app.get("/api/overview")
-def overview(city: str = "Mumbai", route: str = "Andheri → BKC", hour: int | None = None,
-             lat: float | None = None, lon: float | None = None,
-             rain: bool = False, holiday: bool = False):
-    b = bundle()
-    r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
+def _at_with(hour: int | None = None, dow: int | None = None) -> dt.datetime:
+    """Target datetime: upcoming `dow` (Mon=0..Sun=6) at `hour`, else now."""
     at = dt.datetime.now().replace(second=0, microsecond=0)
+    if dow is not None:
+        at = at + dt.timedelta(days=(int(dow) % 7 - at.weekday()) % 7)
     if hour is not None:
         at = at.replace(hour=int(hour) % 24, minute=0)
-    weather, flow = _live(city, r, at, rain_override=rain, holiday_override=holiday)
+    return at
+
+
+@app.get("/api/overview")
+def overview(city: str = "Mumbai", route: str = "Andheri → BKC", hour: int | None = None,
+             dow: int | None = None,
+             lat: float | None = None, lon: float | None = None,
+             rain: bool = False, rain_mm: float = 0.0, holiday: bool = False):
+    b = bundle()
+    r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
+    at = _at_with(hour, dow)
+    weather, flow = _live(city, r, at, rain_override=rain, rain_mm=rain_mm, holiday_override=holiday)
     p = _clean(predict_pipeline(at, weather, flow, b, city=city.split(" ")[0]))
     return {"at": at.isoformat(), "city": city, "route": r["name"],
             "weather": weather, "flow": flow, "pred": p,
@@ -205,12 +215,13 @@ def overview(city: str = "Mumbai", route: str = "Andheri → BKC", hour: int | N
 
 @app.get("/api/forecast")
 def forecast(city: str = "Mumbai", route: str = "Andheri → BKC",
+             dow: int | None = None,
              lat: float | None = None, lon: float | None = None,
-             rain: bool = False, holiday: bool = False):
+             rain: bool = False, rain_mm: float = 0.0, holiday: bool = False):
     b = bundle()
     r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
-    at = dt.datetime.now().replace(second=0, microsecond=0)
-    weather, flow = _live(city, r, at, rain_override=rain, holiday_override=holiday)
+    at = _at_with(None, dow)
+    weather, flow = _live(city, r, at, rain_override=rain, rain_mm=rain_mm, holiday_override=holiday)
     rows = []
     for m in [0, 15, 30, 60]:
         p = _clean(predict_pipeline(at, weather, flow, b, minutes_ahead=m, city=city.split(" ")[0]))
@@ -244,10 +255,14 @@ def patterns():
     h["dow"] = h["date_time"].dt.dayofweek
     gh = h.groupby("hour")["traffic_volume"].mean()
     gd = h.groupby("dow")["traffic_volume"].mean()
+    gwd = h[h["dow"] < 5].groupby("hour")["traffic_volume"].mean()
+    gwe = h[h["dow"] >= 5].groupby("hour")["traffic_volume"].mean()
     piv = h.pivot_table(index="dow", columns="hour", values="traffic_volume", aggfunc="mean")
     w = h.groupby("weather_main")["traffic_volume"].mean().sort_values()
     return {
         "hourly": [{"hour": int(i), "vol": round(float(v))} for i, v in gh.items()],
+        "hourly_weekday": [{"hour": int(i), "vol": round(float(v))} for i, v in gwd.items()],
+        "hourly_weekend": [{"hour": int(i), "vol": round(float(v))} for i, v in gwe.items()],
         "weekday": [{"dow": int(i), "vol": round(float(v))} for i, v in gd.items()],
         "heatmap": {"dows": [int(i) for i in piv.index], "hours": [int(c) for c in piv.columns],
                     "values": [[round(float(x)) for x in row] for row in piv.values.tolist()]},
@@ -258,10 +273,11 @@ def patterns():
 
 
 @app.get("/api/adaptation")
-def adaptation(city: str = "Mumbai", route: str = "Andheri → BKC"):
+def adaptation(city: str = "Mumbai", route: str = "Andheri → BKC",
+               lat: float | None = None, lon: float | None = None):
     b = bundle()
     m = b.get("metrics", {})
-    r = _route(city, route)
+    r = _custom_route(lat, lon) if lat is not None and lon is not None else _route(city, route)
     at = dt.datetime.now().replace(second=0, microsecond=0)
     weather, flow = _live(city, r, at)
     p = _clean(predict_pipeline(at, weather, flow, b, city=city.split(" ")[0]))
@@ -327,9 +343,20 @@ def whatif(hour: int = 18, dow: int = 2, month: int = 10, weekend: int = 0, holi
     row["is_holiday"] = int(holiday)
     X = np.array([[row[f] for f in FEATURES]])
     vol = float(b["model"].predict(X)[0])
+    # Staged GBM-ensemble inference: base -> Ridge-adapted (marginal deltas for waterfall)
+    adapted = vol
+    calib = b.get("calibration")
+    if calib is not None:
+        try:
+            adapted = float(calib.predict(np.array([[vol, row["rain_1h"], row["hour"], row["is_peak"]]]))[0])
+        except Exception:
+            pass
+    th = b["thresholds"]
     imp = b.get("importances", {})
     order = sorted(imp, key=lambda k: -imp[k]) if imp else list(FEATURES)
-    return {"volume": int(round(vol)), "level": _classify(vol, b["thresholds"]),
+    return {"volume": int(round(vol)), "level": _classify(vol, th),
+            "adapted_volume": int(round(adapted)), "adapted_level": _classify(adapted, th),
+            "calibration_delta": int(round(adapted - vol)),
             "features": {k: row[k] for k in FEATURES},
             "importances": [{"feature": k, "importance": float(imp.get(k, 0))} for k in order],
             "prescription": ("Shift departure ~2h earlier (saves ~35%)" if vol > float(b["thresholds"][1])
@@ -403,3 +430,175 @@ def tiles():
         return {"url": None, "live": False}
     return {"url": "https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=" + tt_key(),
             "live": True}
+
+
+@app.get("/api/model")
+def model_info():
+    b = bundle()
+    m = b.get("metrics", {})
+    return {"backend": type(b.get("model")).__name__, "metrics": m,
+            "thresholds": [float(x) for x in b["thresholds"]],
+            "custom": _bundle_meta["custom"], "trained_at": _bundle_meta["trained_at"],
+            "source": _bundle_meta["source"]}
+
+
+@app.post("/api/retrain")
+async def retrain(file: UploadFile = File(...), num_trees: int = 60, max_depth: int = 6, lr: float = 0.05):
+    """CSV upload retrain (UCI schema) -> swaps the live bundle in memory. Training may take ~1 min."""
+    import io
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from schema import FEATURES, WEATHER_CODE, add_features
+    from data_generator import load_historical
+
+    if file is None or not hasattr(file, "read"):
+        raise HTTPException(400, "upload a CSV file as 'file'")
+    raw = await file.read()
+    if len(raw) < 100:
+        raise HTTPException(400, "CSV too small")
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(400, f"unreadable CSV: {e}")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    rename = {"volume": "traffic_volume", "count": "traffic_volume", "flow": "traffic_volume",
+              "datetime": "date_time", "timestamp": "date_time",
+              "temperature": "temp", "rain": "rain_1h", "snow": "snow_1h", "clouds": "clouds_all"}
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    for need in ("traffic_volume", "date_time"):
+        if need not in df.columns:
+            raise HTTPException(400, f"CSV needs '{need}' column (got {list(df.columns)})")
+    for col, default in (("holiday", "None"), ("temp", 290.0), ("rain_1h", 0.0),
+                         ("snow_1h", 0.0), ("clouds_all", 20), ("weather_main", "Clear")):
+        if col not in df.columns:
+            df[col] = default
+    df["date_time"] = pd.to_datetime(df["date_time"], errors="coerce")
+    df = df.dropna(subset=["date_time", "traffic_volume"]).drop_duplicates("date_time")
+    df = df.sort_values("date_time").reset_index(drop=True)
+    if len(df) < 500:
+        raise HTTPException(400, f"need >=500 rows, got {len(df)}")
+    df = add_features(df)
+    X, y = df[FEATURES], df["traffic_volume"]
+    k = int(len(df) * 0.8)
+    Xtr, Xte, ytr, yte = X.iloc[:k], X.iloc[k:], y.iloc[:k], y.iloc[k:]
+    try:
+        from xgboost import XGBRegressor
+        model = XGBRegressor(n_estimators=max(10, min(150, num_trees)),
+                             max_depth=max(2, min(8, max_depth)),
+                             learning_rate=float(lr), n_jobs=-1, random_state=42)
+        backend = "xgboost"
+    except ImportError:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        model = HistGradientBoostingRegressor(max_iter=max(10, min(150, num_trees)), random_state=42)
+        backend = "sklearn-hgb"
+    model.fit(Xtr, ytr)
+    pred = model.predict(Xte)
+    mae = float(mean_absolute_error(yte, pred))
+    rmse = float(mean_squared_error(yte, pred) ** 0.5)
+    th = [float(v) for v in np.percentile(ytr, [25, 50, 75])]
+    p95 = float(np.percentile(ytr, 95))
+    # Refit India calibration head on synthetic corridor sample (same convention as train_model.py)
+    ind = load_historical(indian_style=True).iloc[:336].copy()
+    ind["date_time"] = pd.to_datetime(ind["date_time"])
+    ind = add_features(ind)
+    base_ind = model.predict(ind[FEATURES].to_numpy())
+    cal = Ridge(alpha=1.0)
+    cal.fit(np.column_stack([base_ind, ind["rain_1h"].to_numpy(),
+                             ind["hour"].to_numpy(), ind["is_peak"].to_numpy()]),
+            ind["traffic_volume"].to_numpy())
+    try:
+        from sklearn.inspection import permutation_importance
+        r = permutation_importance(model, Xte.iloc[:500].to_numpy(), yte.iloc[:500].to_numpy(),
+                                   n_repeats=3, random_state=42)
+        imp = {f: float(v) for f, v in zip(FEATURES, r.importances_mean)}
+    except Exception:
+        imp = {f: 1.0 / len(FEATURES) for f in FEATURES}
+    global _bundle
+    _bundle = {"model": model, "calibration": cal, "thresholds": th, "features": FEATURES,
+               "weather_code": WEATHER_CODE,
+               "metrics": {"base_mae": mae, "base_rmse": rmse, "p95_volume": p95,
+                           "n_us": int(len(df)), "n_india_calib": 336,
+                           "calib_mae_adapted": float(mean_absolute_error(
+                               ind["traffic_volume"].to_numpy(), cal.predict(np.column_stack(
+                                   [base_ind, ind["rain_1h"].to_numpy(), ind["hour"].to_numpy(),
+                                    ind["is_peak"].to_numpy()])))),
+                           "calib_mae_unadapted": float(mean_absolute_error(
+                               ind["traffic_volume"].to_numpy(), base_ind))},
+               "importances": imp}
+    _bundle_meta.update({"custom": True, "trained_at": dt.datetime.now().isoformat(timespec="seconds"),
+                         "source": f"upload:{file.filename}"})
+    return {"ok": True, "backend": backend, "metrics": _bundle["metrics"], "thresholds": th,
+            "custom": True}
+
+
+@app.get("/api/corridor")
+def corridor(olat: float, olon: float, dlat: float, dlon: float):
+    """Free source->destination routing: TomTom live route if key, else haversine fallback,
+    plus midpoint congestion prediction + advice."""
+    import math
+    b = bundle()
+    route_info, live = None, False
+    if tt_key():
+        try:
+            from traffic_api import fetch_tomtom_route
+            r = fetch_tomtom_route((olat, olon), (dlat, dlon), tt_key())
+            if r.get("live_min"):
+                route_info = {"dist_km": r["distance_km"], "live_min": r["live_min"],
+                              "free_min": r["free_min"], "delay_min": r["delay_min"]}
+                live = True
+        except Exception:
+            pass
+    if route_info is None:
+        R = 6371.0
+        p1, p2 = math.radians(olat), math.radians(dlat)
+        h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+             * math.sin(math.radians(dlon - olon) / 2) ** 2)
+        dist = 2 * R * math.asin(math.sqrt(h))
+        free_min = dist / 50 * 60
+        live_min = dist / 30 * 60
+        route_info = {"dist_km": round(dist, 2), "live_min": round(live_min, 1),
+                      "free_min": round(free_min, 1), "delay_min": round(live_min - free_min, 1)}
+    mlat, mlon = (olat + dlat) / 2, (olon + dlon) / 2
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather = fetch_openweather(mlat, mlon, ow_key() or None)
+    flow = fetch_tomtom_flow(mlat, mlon, 50, tt_key() or None, 0.4)
+    p = _clean(predict_pipeline(at, weather, flow, b, city="Mumbai"))
+    lvl = p["final_level"]
+    advice = ("Leave ~2h later or split the trip — severe mid-corridor load." if lvl == "Severe"
+              else "Expect slow patches — allow +15 min buffer." if lvl == "High"
+              else "Corridor flowing — good time to depart.")
+    return {"origin": [olat, olon], "dest": [dlat, dlon], "mid": [mlat, mlon],
+            "route": route_info, "live_routing": live, "pred": p,
+            "weather": weather, "flow": flow, "advice": advice, "colors": LEVEL_COLOR}
+
+
+GRID_OFFSETS = [
+    (-0.018, -0.018, "North-West Arterial"), (-0.018, 0.0, "North Radial Ring"),
+    (-0.018, 0.018, "North-East Expressway"), (0.0, -0.018, "West Central Avenue"),
+    (0.0, 0.0, "City Center Hub"), (0.0, 0.018, "East Business Corridor"),
+    (0.018, -0.018, "South-West Terminal"), (0.018, 0.0, "South Coastal Link"),
+    (0.018, 0.018, "South-East Bypass"),
+]
+
+
+@app.get("/api/grid")
+def grid(city: str = "Mumbai", horizon: int = 0):
+    """9-point telemetry grid around a city center for the given forecast horizon."""
+    b = bundle()
+    if city not in CITIES:
+        raise HTTPException(404, "unknown city")
+    clat, clon = CITIES[city]["center"]
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    weather, _ = _live(city, {"lat": clat, "lon": clon, "free_flow": 50, "length_km": 5.0}, at)
+    out = []
+    for i, (dla, dlo, name) in enumerate(GRID_OFFSETS):
+        plat, plon = clat + dla, clon + dlo
+        fl = fetch_tomtom_flow(plat, plon, 50 + (i % 3) * 5, tt_key() or None, 0.4)
+        p = predict_pipeline(at, weather, fl, b, minutes_ahead=max(0, min(60, horizon)),
+                             city=city.split(" ")[0])
+        out.append({"name": name, "lat": plat, "lon": plon, "level": p["final_level"],
+                    "vol": p["final_vol"], "speed": fl["current_speed"],
+                    "free": fl["free_flow_speed"], "source": fl["source"]})
+    return {"city": city, "horizon": horizon, "points": out, "colors": LEVEL_COLOR}

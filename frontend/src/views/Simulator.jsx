@@ -43,6 +43,21 @@ export default function Simulator() {
             <div className="card"><h4>Congestion index</h4><b>{LEVEL_EMOJI[out.level]} {out.level}</b></div>
             <div className="card"><h4>Advice</h4><span>{out.prescription}</span></div>
           </div>
+          <h4>GBM ensemble inference — marginal attribution waterfall</h4>
+          <p className="muted">Base US prediction {out.volume.toLocaleString()} → calibration {out.calibration_delta >= 0 ? '+' : ''}{(out.calibration_delta || 0).toLocaleString()} → adapted {(out.adapted_volume ?? out.volume).toLocaleString()} ({out.adapted_level || out.level})</p>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={[
+              { n: 'Base (US)', lo: 0, w: out.volume },
+              { n: 'Calibration Δ', lo: Math.min(out.volume, out.adapted_volume ?? out.volume), w: Math.abs(out.calibration_delta || 0) },
+              { n: 'Adapted (India)', lo: 0, w: out.adapted_volume ?? out.volume },
+            ]}>
+              <XAxis dataKey="n" />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="lo" stackId="s" fill="transparent" />
+              <Bar dataKey="w" stackId="s" fill="#7c3aed" name="veh/hr" />
+            </BarChart>
+          </ResponsiveContainer>
           <h4>What the model relies on (global importance)</h4>
           <ResponsiveContainer width="100%" height={260}>
             <BarChart data={out.importances.slice(0, 10)} layout="vertical" margin={{ left: 90 }}>

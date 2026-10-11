@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { api, LEVEL_EMOJI } from '../api'
 import { CountUp, FusionCard, GaugeNeedle } from '../components/common'
+import { nextEvent } from '../data/events'
 
 function verdictOf(rows, liveLevel) {
   if (!rows?.length) return 'Analyzing corridor throughput…'
@@ -17,8 +18,9 @@ function verdictOf(rows, liveLevel) {
   return `Traffic remains ${liveLevel} and steady.`
 }
 
-export default function Overview({ data, forecast, city, route, rain, holiday }) {
+export default function Overview({ data, forecast, city, route, rain, holiday, goCalendar }) {
   const [insight, setInsight] = useState(null)
+  const [ev] = useState(() => nextEvent())
   useEffect(() => {
     if (city && route) api.insight(city, route).then(setInsight).catch(() => {})
   }, [city, route])
@@ -32,10 +34,10 @@ export default function Overview({ data, forecast, city, route, rain, holiday })
         <div className="alert">🚨 SEVERE congestion — consider an alternate route.</div>
       )}
       <div className="cards">
-        <div className="card"><h4>Live Now · congestion</h4><b><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} suffix="%" /></b><GaugeNeedle ratio={flow.congestion_ratio} /></div>
-        <div className="card"><h4>Live speed</h4><b><CountUp value={flow.current_speed} /> km/h</b><span>free {flow.free_flow_speed} · {flow.congestion_ratio < 0.5 ? 'jammed' : 'flowing'}</span></div>
-        <div className="card"><h4>Predicted volume</h4><b><CountUp value={pred.final_vol} /> veh/hr</b><span>{lvl} · delay +{flow.delay_min} min</span></div>
-        <div className="card"><h4>Weather</h4><b>{weather.weather_main} {(weather.temp - 273.15).toFixed(0)}°C</b><span>rain {weather.rain_1h} mm/h · clouds {weather.clouds_all}%</span></div>
+        <div className="card"><h4>Live Now · congestion</h4><div className="bignum"><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} /><span className="unit">%</span></div><GaugeNeedle ratio={flow.congestion_ratio} /></div>
+        <div className="card"><h4>Live speed</h4><div className="bignum"><CountUp value={flow.current_speed} /><span className="unit">km/h</span></div><span className="sub">free {flow.free_flow_speed} · {flow.congestion_ratio < 0.5 ? 'jammed' : 'flowing'}</span></div>
+        <div className="card"><h4>Predicted volume</h4><div className="bignum"><CountUp value={pred.final_vol} /><span className="unit">veh/hr</span></div><span className="sub">{lvl} · delay +{flow.delay_min} min</span></div>
+        <div className="card"><h4>Weather</h4><div className="bignum">{(weather.temp - 273.15).toFixed(0)}<span className="unit">°C · {weather.weather_main}</span></div><span className="sub">rain {weather.rain_1h} mm/h · clouds {weather.clouds_all}%</span></div>
       </div>
       <h3>
         <span className="badge" style={{ background: colors[lvl] }}>{LEVEL_EMOJI[lvl]} {lvl}</span>
@@ -44,6 +46,17 @@ export default function Overview({ data, forecast, city, route, rain, holiday })
       <p className="verdict">📣 City transit verdict: <b>{verdict}</b></p>
       <p className="muted">Sources: {flow.source} / {weather.source}</p>
       <FusionCard flow={flow} pred={pred} />
+      <div className="cards">
+        <div className="card"><h4>Legacy (history only)</h4><div className="bignum">{pred.base_vol}<span className="unit">veh/hr</span></div><span className="sub">static US baseline · {pred.base_level}</span></div>
+        <div className="card"><h4>Upgraded (live fused)</h4><div className="bignum">{pred.final_vol}<span className="unit">veh/hr</span></div><span className="sub">{pred.base_vol ? `${pred.final_vol >= pred.base_vol ? '+' : ''}${Math.round((pred.final_vol - pred.base_vol) / pred.base_vol * 100)}% real-world correction` : ''} · {lvl}</span></div>
+      </div>
+      {ev && (
+        <div className="card">
+          <h4>🏮 Upcoming: {ev.title} — {ev.date}</h4>
+          <span>{ev.start}–{ev.end} · {(ev.attendees || 0).toLocaleString()}+ expected · surge ×{ev.surge}</span>
+          <div><button onClick={() => goCalendar && goCalendar()}>Open event calendar →</button></div>
+        </div>
+      )}
       <h3>🔍 Why this prediction?</h3>
       {shap.headline && <p><b>{shap.headline}</b></p>}
       {shap.summary && <p className="muted">{shap.summary}</p>}

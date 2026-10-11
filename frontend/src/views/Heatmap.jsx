@@ -12,8 +12,10 @@ function FlyTo({ center }) {
 
 const HORIZONS = [0, 15, 30, 60]
 
-export default function Heatmap({ data, city, forecast }) {
+export default function Heatmap({ data, city, forecast, dark }) {
   const [hz, setHz] = useState(0)
+  const [mode, setMode] = useState('corridors')
+  const [grid, setGrid] = useState(null)
   const [raster, setRaster] = useState(false)
   const [tileUrl, setTileUrl] = useState(null)
   const [exporting, setExporting] = useState(false)
@@ -21,10 +23,19 @@ export default function Heatmap({ data, city, forecast }) {
   if (!data) return <p>Loading…</p>
   const pts = data.points
   const center = pts.length ? [pts[0].lat, pts[0].lon] : [19.076, 72.8777]
+  const baseTiles = dark
+    ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
 
   useEffect(() => {
     api.tiles().then((t) => t.live && setTileUrl(t.url)).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (mode === 'grid' && city) {
+      api.grid(city, hz).then(setGrid).catch(() => setGrid(null))
+    }
+  }, [mode, city, hz])
 
   // Horizon: scale each point's volume by forecast trend ratio
   let ratio = 1
@@ -34,6 +45,9 @@ export default function Heatmap({ data, city, forecast }) {
     ratio = at / now
   }
   const adj = pts.map((p) => ({ ...p, dvol: Math.round(p.vol * ratio) }))
+  const shown = mode === 'grid' && grid?.points
+    ? grid.points.map((p) => ({ route: p.name, lat: p.lat, lon: p.lon, level: p.level, vol: p.vol, dvol: p.vol, speed: p.speed }))
+    : adj
 
   const exportPng = async () => {
     if (!wrapRef.current) return
@@ -50,8 +64,12 @@ export default function Heatmap({ data, city, forecast }) {
 
   return (
     <div>
-      <h3>🗺 Congestion heatmap — {data.city}</h3>
+      <h3>🗺 Congestion map — {data.city}</h3>
       <div className="maptools">
+        <div className="pills">
+          <button className={mode === 'corridors' ? 'active' : ''} onClick={() => setMode('corridors')}>Corridors</button>
+          <button className={mode === 'grid' ? 'active' : ''} onClick={() => setMode('grid')}>9-point grid</button>
+        </div>
         <div className="pills">
           {HORIZONS.map((h) => (
             <button key={h} className={hz === h ? 'active' : ''} onClick={() => setHz(h)}>
@@ -70,10 +88,10 @@ export default function Heatmap({ data, city, forecast }) {
       </div>
       <div ref={wrapRef}>
         <MapContainer center={center} zoom={11} style={{ height: 480, borderRadius: 12 }}>
-          <TileLayer url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
+          <TileLayer url={baseTiles} />
           {raster && tileUrl && <TileLayer url={tileUrl} opacity={0.65} zIndex={10} />}
           <FlyTo center={center} />
-          {adj.map((p) => (
+          {shown.map((p) => (
             <CircleMarker
               key={p.route}
               center={[p.lat, p.lon]}

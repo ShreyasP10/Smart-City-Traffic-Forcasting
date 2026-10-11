@@ -11,10 +11,19 @@ export const api = {
   forecast: (city, route, opts = {}) => get('/api/forecast', { city, route, ...opts }),
   heatmap: (city) => get('/api/heatmap', { city }),
   patterns: () => get('/api/patterns'),
-  adaptation: (city, route) => get('/api/adaptation', { city, route }),
+  adaptation: (city, route, opts = {}) => get('/api/adaptation', { city, route, ...opts }),
   compare: (city, a, b) => get('/api/compare', { city, a, b }),
   whatif: (p) => get('/api/whatif', p),
   diagnostics: () => get('/api/diagnostics'),
+  model: () => get('/api/model'),
+  retrain: (file, params) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    Object.entries(params || {}).forEach(([k, v]) => fd.append(k, v))
+    return axios.post('/api/retrain', fd, { timeout: 300000 }).then((r) => r.data)
+  },
+  corridor: (olat, olon, dlat, dlon) => get('/api/corridor', { olat, olon, dlat, dlon }),
+  grid: (city, horizon) => get('/api/grid', { city, horizon }),
   insight: (city, route) => get('/api/insight', { city, route }),
   geocode: (q) => get('/api/geocode', { q }),
   tiles: () => get('/api/tiles'),

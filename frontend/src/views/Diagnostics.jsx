@@ -22,6 +22,13 @@ export default function Diagnostics() {
         <div className="card"><h4>RMSE</h4><b>{d.metrics.base_rmse?.toFixed(1)}</b></div>
         <div className="card"><h4>Thresholds</h4><b>{d.thresholds.map((t) => Math.round(t).toLocaleString()).join(' / ')}</b><span>Low→Severe quartiles</span></div>
       </div>
+      <h4>ML model architecture (inspector)</h4>
+      <div className="cards">
+        <div className="card"><h4>Stage 1 · Learner</h4><b>{d.backend}</b><span>300 trees · depth 6 · lr 0.05 · 16 canonical features · chronological 80/20 train/test</span></div>
+        <div className="card"><h4>Stage 2 · Adaptation head</h4><b>Ridge</b><span>inputs: base_pred, rain, hour, is_peak → India scale</span></div>
+        <div className="card"><h4>Stage 3 · Live fusion</h4><b>0.65 / 0.35</b><span>adapted history + live-implied volume, decaying over 60 min</span></div>
+        <div className="card"><h4>Stage 4 · Decision</h4><b>{d.thresholds.map((t) => Math.round(t / 1000) + 'k').join(' / ')}</b><span>quartile bins → Low / Moderate / High / Severe</span></div>
+      </div>
       <h4>Feature importance (global)</h4>
       <ResponsiveContainer width="100%" height={260}>
         <BarChart data={d.importances.slice(0, 12)} layout="vertical" margin={{ left: 90 }}>
