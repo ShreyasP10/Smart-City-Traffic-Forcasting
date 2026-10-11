@@ -117,9 +117,10 @@ us_df, india_df = load_data()
 st.sidebar.title("🚦 Controls")
 city = st.sidebar.selectbox("City (context)", list(CITIES.keys()), index=0)
 routes = CITIES[city]["routes"]
-route_names = [r["name"] for r in routes]
-route_name = st.sidebar.selectbox("Route / location", route_names)
-route = next(r for r in routes if r["name"] == route_name)
+route_name = st.sidebar.selectbox("Route / location", route_names, key=f"route_{city}")
+route = next((r for r in routes if r["name"] == route_name), routes[0] if routes else None)
+if route is None:
+    route = {"name": route_name or "Default route", "lat": 19.076, "lon": 72.877, "free_flow": 50, "length_km": 5.0}
 
 with st.sidebar.expander("➕ Custom location (optional)"):
     c_lat = st.number_input("Latitude", value=float(route["lat"]), min_value=-90.0, max_value=90.0, format="%.5f")
@@ -533,40 +534,43 @@ with tab6:
     st.subheader("Route comparison — pick the faster corridor")
     col_a, col_b = st.columns(2)
     with col_a:
-        a_name = st.selectbox("Route A", route_names, index=0, key="ra")
+        a_name = st.selectbox("Route A", route_names, index=0, key=f"ra_{city}")
     with col_b:
-        b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key="rb")
+        b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key=f"rb_{city}")
 
     if a_name == b_name:
         st.warning("⚠️ Please select two different routes to compare corridors.")
     else:
-        ra = next(r for r in routes if r["name"] == a_name)
-        rb = next(r for r in routes if r["name"] == b_name)
-        results = []
-        for r in (ra, rb):
-            fl = cached_fetch_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, hint)
-            p = predict_pipeline(at, weather, fl, bundle, city=city)
-            len_km = max(float(r.get("length_km", 5.0)), 0.5)
-            cur_spd = max(float(fl.get("current_speed") or 10.0), 5.0)
-            ff_spd = max(float(fl.get("free_flow_speed") or 30.0), 10.0)
-            tmin = round(len_km / cur_spd * 60, 1)
-            free_min = round(len_km / ff_spd * 60, 1)
-            results.append({
-                "route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
-                "speed": fl["current_speed"], "trip_min": tmin, "delay": round(max(tmin - free_min, 0.0), 1)
-            })
-        res_df = pd.DataFrame(results)
-        st.dataframe(res_df, use_container_width=True)
-        best = res_df.loc[res_df["trip_min"].idxmin()]
-        st.success(f"✅ Recommendation: **{html.escape(str(best['route']))}** — {best['trip_min']} min, "
-                   f"{best['level']} congestion at {best['speed']} km/h.")
-        try:
-            import plotly.express as px
-            st.plotly_chart(px.bar(res_df, x="route", y="trip_min", color="level",
-                                   color_discrete_map=LEVEL_COLOR, title="Trip-time comparison"),
-                            use_container_width=True)
-        except Exception:
-            st.bar_chart(res_df.set_index("route")["trip_min"])
+        ra = next((r for r in routes if r["name"] == a_name), routes[0] if routes else None)
+        rb = next((r for r in routes if r["name"] == b_name), (routes[1] if len(routes) > 1 else routes[0]) if routes else None)
+        if not ra or not rb:
+            st.info("Please select valid routes.")
+        else:
+            results = []
+            for r in (ra, rb):
+                fl = cached_fetch_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, hint)
+                p = predict_pipeline(at, weather, fl, bundle, city=city)
+                len_km = max(float(r.get("length_km", 5.0)), 0.5)
+                cur_spd = max(float(fl.get("current_speed") or 10.0), 5.0)
+                ff_spd = max(float(fl.get("free_flow_speed") or 30.0), 10.0)
+                tmin = round(len_km / cur_spd * 60, 1)
+                free_min = round(len_km / ff_spd * 60, 1)
+                results.append({
+                    "route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
+                    "speed": fl["current_speed"], "trip_min": tmin, "delay": round(max(tmin - free_min, 0.0), 1)
+                })
+            res_df = pd.DataFrame(results)
+            st.dataframe(res_df, use_container_width=True)
+            best = res_df.loc[res_df["trip_min"].idxmin()]
+            st.success(f"✅ Recommendation: **{html.escape(str(best['route']))}** — {best['trip_min']} min, "
+                       f"{best['level']} congestion at {best['speed']} km/h.")
+            try:
+                import plotly.express as px
+                st.plotly_chart(px.bar(res_df, x="route", y="trip_min", color="level",
+                                       color_discrete_map=LEVEL_COLOR, title="Trip-time comparison"),
+                                use_container_width=True)
+            except Exception:
+                st.bar_chart(res_df.set_index("route")["trip_min"])
 
 st.divider()
 st.caption("Hardened prototype: XGBoost + Ridge calibration · TomTom + OpenWeather / Open-Meteo · Canonical schema.")

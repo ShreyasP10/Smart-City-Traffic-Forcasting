@@ -156,6 +156,23 @@ class TestSmartCityTraffic(unittest.TestCase):
         with self.assertRaises(ValueError):
             safe_load_model(model_path, "0000000000000000000000000000000000000000000000000000000000000000")
 
+    def test_07_route_lookup_and_fallback(self):
+        """Verify robust route lookup and fallback across cities."""
+        from api import _route
+        # Exact match
+        r1 = _route("Mumbai", "Andheri → BKC")
+        self.assertEqual(r1["name"], "Andheri → BKC")
+
+        # Unknown route fallback to first route of the city
+        r2 = _route("Mumbai", "Invalid Route Name")
+        self.assertEqual(r2["name"], "Andheri → BKC")
+
+        # Unknown city fallback
+        r3 = _route("Atlantis", "Unknown")
+        self.assertIn("name", r3)
+        self.assertIn("lat", r3)
+        self.assertIn("lon", r3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

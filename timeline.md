@@ -253,6 +253,31 @@ Workspace: `Smart City Traffic Forcasting/`
   suggest ⭐ popular places first, then live geocode. Fixed own dup-import break.
 - CSS: keyboard-focus row, `<mark>` highlight (both themes). `npm run build` ✅.
 
+## 14:30–14:40 — "Only loading" root-caused: backend was down
+- Verified: :5173 serving (user's dev server), :8000 silent — every symptom (Loading…,
+  empty suggestions) traced to dead backend, not UI code.
+- Hardened per reference app's client-side `geocodeApi`: `api.geocode` now falls back to
+  direct Nominatim fetch; CityField carries hardcoded known-city fallback — suggestions
+  work with zero backend.
+- Added backend-offline banner (exact restart command + Retry button) and Settings
+  recheck; `npm run build` ✅.
+
+## 14:40–14:50 — Selectable path options
+- `/api/corridor` += `alts`: live TomTom `maxAlternatives` (Fastest/Alternative 1/2) or
+  synthesized Fastest/Shortest pair; response carries `options[]` (back-compat `route`
+  = first). Verified: Fastest 11.3 min/5.66 km vs Shortest 12.0/5.21.
+- Route tab: selectable path-option pills driving the stat cards. Killed stale PID 7420
+  squatting :8000 with old code before trusting the test. `npm run build` ✅.
+
+## 14:50–15:00 — Blank Route tab + dead maps triage
+- Versions ruled out (React 19 + react-leaflet 5 + leaflet 1.9.4, all compatible).
+- Likely culprits addressed: key-remount on planner map → FlyTo glide; CartoDB `{r}`
+  URL variant → plain OSM standard tiles (dark keeps dark_all); added global
+  `window.onerror` red banner in `main.jsx` so any future blank becomes a readable
+  error; tab-level ErrorBoundary already in place. `npm run build` ✅.
+- If blank persists: hard-refresh (Ctrl+Shift+R) with BOTH servers freshly restarted,
+  then paste the banner text.
+
 ## 14:00–14:20 — Free-text everywhere + weekday lookup + analysis charts + hardening
 - Backend: `/patterns` += weekday/weekend diurnal series; `/whatif` += staged
   base→adapted + calibration_delta (3682→2146 ✅); `/overview` + `/forecast` += `dow`

@@ -49,6 +49,7 @@ export default function App() {
   const [tick, setTick] = useState(0)
   const [toast, setToast] = useState(null)
   const [model, setModel] = useState(null)
+  const [backendDown, setBackendDown] = useState(false)
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem('traffic-theme') || 'light' } catch { return 'light' }
   })
@@ -68,7 +69,8 @@ export default function App() {
         setCmpB(m.routes[1]?.name ?? m.routes[0].name)
       }
     }).catch(() => {})
-    api.health().then(setLive).catch(() => {})
+    api.health().then((h) => { setLive(h); setBackendDown(false) }).catch(() => setBackendDown(true))
+    api.model().then(setModel).catch(() => {})
     api.model().then(setModel).catch(() => {})
   }, [])
 
@@ -100,6 +102,7 @@ export default function App() {
         if (f) setData((s) => ({ ...s, forecast: f }))
         return o
       },
+      route: () => Promise.resolve(true),
       forecast: () => api.forecast(apiCity, rname, { ...base, ...routeLL }),
       heatmap: async () => {
         const [m, f] = await Promise.all([
@@ -117,7 +120,8 @@ export default function App() {
       alerts: () => api.forecast(apiCity, rname, { ...base, ...routeLL }),
       compare: () => Promise.resolve(true),
     }
-    jobs[tab]().then((d) => setData((s) => ({ ...s, [tab]: d }))).catch(() => {}).finally(() => setLoading(false))
+    const runner = jobs[tab] || (() => Promise.resolve(true))
+    runner().then((d) => setData((s) => ({ ...s, [tab]: d }))).catch(() => {}).finally(() => setLoading(false))
   }, [tab, city, route, hour, dow, rainMm, holiday, custom, tick])
 
   useEffect(() => {
@@ -205,7 +209,20 @@ export default function App() {
         ))}
       </nav>
       <main>
+        {backendDown && (
+          <div className="alert">
+            <b>🔴 Backend offline — this page can't load data.</b>
+            <p>Open a second terminal in the project folder and run:</p>
+            <p><code>python -m uvicorn api:app --port 8000</code></p>
+            <button onClick={() => {
+              api.health()
+                .then((h) => { setLive(h); setBackendDown(false); setTick((t) => t + 1) })
+                .catch(() => setBackendDown(true))
+            }}>Retry connection →</button>
+          </div>
+        )}
         {loading && <p className="muted">Fetching live data…</p>}
+        {!loading && backendDown && <p className="muted">City suggestions still work (world search runs in your browser). Predictions need the backend.</p>}
         <ErrorBoundary key={tab}>
         {tab === 'overview' && <Overview data={data.overview} forecast={data.forecast} city={city} route={routeName} rain={rainMm > 0} holiday={holiday} goCalendar={() => setTab('calendar')} />}
         {tab === 'route' && <CorridorPlanner />}
@@ -220,7 +237,7 @@ export default function App() {
         {tab === 'compare' && <Compare />}
         </ErrorBoundary>
       </main>
-      <SettingsModal open={settings} onClose={() => setSettings(false)} onSaved={() => { api.health().then(setLive).catch(() => {}); setTick((t) => t + 1) }} />
+      <SettingsModal open={settings} onClose={() => setSettings(false)} onSaved={() => { api.health().then((h) => { setLive(h); setBackendDown(false) }).catch(() => {}); setTick((t) => t + 1) }} />
       {toast && (
         <div className="toast" onClick={() => setToast(null)}>
           <b>🔔 {toast.title}</b>

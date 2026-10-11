@@ -22,10 +22,31 @@ export const api = {
     Object.entries(params || {}).forEach(([k, v]) => fd.append(k, v))
     return axios.post('/api/retrain', fd, { timeout: 300000 }).then((r) => r.data)
   },
-  corridor: (olat, olon, dlat, dlon) => get('/api/corridor', { olat, olon, dlat, dlon }),
+  corridor: (olat, olon, dlat, dlon, alts = 2) => get('/api/corridor', { olat, olon, dlat, dlon, alts }),
   grid: (city, horizon) => get('/api/grid', { city, horizon }),
   insight: (city, route) => get('/api/insight', { city, route }),
-  geocode: (q) => get('/api/geocode', { q }),
+  geocode: async (q) => {
+    // Primary: backend proxy. Fallback: Nominatim direct from browser
+    // (same as reference app's client-side geocodeApi) so suggestions
+    // keep working even when the backend is down.
+    try {
+      return await get('/api/geocode', { q })
+    } catch {
+      const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=5&addressdetails=1`, {
+        headers: { Accept: 'application/json' },
+      })
+      if (!r.ok) return { results: [] }
+      const j = await r.json()
+      return {
+        results: j.map((g) => ({
+          name: String(g.display_name || '').split(',').slice(0, 2).join(','),
+          lat: parseFloat(g.lat),
+          lon: parseFloat(g.lon),
+          country: (g.address || {}).country || '',
+        })),
+      }
+    }
+  },
   tiles: () => get('/api/tiles'),
   setKeys: (tomtom, openweather) => post('/api/keys', { tomtom, openweather }),
 };

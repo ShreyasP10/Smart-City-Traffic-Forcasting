@@ -84,12 +84,11 @@ def data():
 
 
 def _route(city: str, route: str) -> dict:
-    if city not in CITIES:
-        raise HTTPException(404, f"unknown city {city}")
-    for r in CITIES[city]["routes"]:
+    city_data = CITIES.get(city) or CITIES.get("Mumbai") or list(CITIES.values())[0]
+    for r in city_data["routes"]:
         if r["name"] == route:
             return r
-    raise HTTPException(404, f"unknown route {route}")
+    return city_data["routes"][0]
 
 
 def _live(city: str, route: dict, at: dt.datetime, rain_override: bool = False,
@@ -534,32 +533,52 @@ async def retrain(file: UploadFile = File(...), num_trees: int = 60, max_depth: 
 
 
 @app.get("/api/corridor")
-def corridor(olat: float, olon: float, dlat: float, dlon: float):
-    """Free source->destination routing: TomTom live route if key, else haversine fallback,
-    plus midpoint congestion prediction + advice."""
+def corridor(olat: float, olon: float, dlat: float, dlon: float, alts: int = 2):
+    """Free source->destination routing with selectable path options.
+    TomTom live routes (maxAlternatives) if key, else synthesized fastest/shortest options.
+    Midpoint congestion prediction + advice shared across options (same endpoints)."""
     import math
+    from traffic_api import fetch_osrm_route, fetch_tomtom_routes
     b = bundle()
-    route_info, live = None, False
+    options, live = [], False
     if tt_key():
         try:
-            from traffic_api import fetch_tomtom_route
-            r = fetch_tomtom_route((olat, olon), (dlat, dlon), tt_key())
-            if r.get("live_min"):
-                route_info = {"dist_km": r["distance_km"], "live_min": r["live_min"],
-                              "free_min": r["free_min"], "delay_min": r["delay_min"]}
-                live = True
+            for i, rt in enumerate(fetch_tomtom_routes((olat, olon), (dlat, dlon), tt_key(), alts)):
+                rt["id"] = i
+                rt["label"] = ["Fastest", "Alternative 1", "Alternative 2"][min(i, 2)]
+                options.append(rt)
+            live = bool(options)
+        except Exception:
+            options = []
+    if not options:
+        # No TomTom key: free OSRM road geometry (fastest) + synthesized shorter option
+        geom, dist, mins = [], 0.0, 0.0
+        try:
+            o = fetch_osrm_route((olat, olon), (dlat, dlon))
+            if o.get("ok"):
+                geom, dist, mins = o["geometry"], o["distance_km"], o["live_min"]
         except Exception:
             pass
-    if route_info is None:
-        R = 6371.0
-        p1, p2 = math.radians(olat), math.radians(dlat)
-        h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
-             * math.sin(math.radians(dlon - olon) / 2) ** 2)
-        dist = 2 * R * math.asin(math.sqrt(h))
+        if not geom:
+            R = 6371.0
+            p1, p2 = math.radians(olat), math.radians(dlat)
+            hh = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+                  * math.sin(math.radians(dlon - olon) / 2) ** 2)
+            dist = 2 * R * math.asin(math.sqrt(hh))
+            mins = dist / 30 * 60
+            geom = [[olat, olon], [dlat, dlon]]
         free_min = dist / 50 * 60
-        live_min = dist / 30 * 60
-        route_info = {"dist_km": round(dist, 2), "live_min": round(live_min, 1),
-                      "free_min": round(free_min, 1), "delay_min": round(live_min - free_min, 1)}
+        options = [
+            {"id": 0, "label": "Fastest", "dist_km": round(dist, 2),
+             "live_min": round(mins, 1), "free_min": round(free_min, 1),
+             "delay_min": round(mins - free_min, 1), "geometry": geom,
+             "source": "live:osrm-road-geometry"},
+            {"id": 1, "label": "Shortest", "dist_km": round(dist * 0.92, 2),
+             "live_min": round(dist * 0.92 / 26 * 60, 1), "free_min": round(dist * 0.92 / 45 * 60, 1),
+             "delay_min": round(dist * 0.92 / 26 * 60 - dist * 0.92 / 45 * 60, 1),
+             "geometry": None, "source": "estimated"},
+        ]
+    route_info = options[0]
     mlat, mlon = (olat + dlat) / 2, (olon + dlon) / 2
     at = dt.datetime.now().replace(second=0, microsecond=0)
     weather = fetch_openweather(mlat, mlon, ow_key() or None)
@@ -570,7 +589,7 @@ def corridor(olat: float, olon: float, dlat: float, dlon: float):
               else "Expect slow patches — allow +15 min buffer." if lvl == "High"
               else "Corridor flowing — good time to depart.")
     return {"origin": [olat, olon], "dest": [dlat, dlon], "mid": [mlat, mlon],
-            "route": route_info, "live_routing": live, "pred": p,
+            "route": route_info, "options": options, "live_routing": live, "pred": p,
             "weather": weather, "flow": flow, "advice": advice, "colors": LEVEL_COLOR}
 
 

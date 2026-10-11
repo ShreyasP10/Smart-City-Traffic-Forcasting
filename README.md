@@ -63,7 +63,7 @@ npm run build          # production build check (verified ✅)
 | `GET /api/geocode?q=` | Nominatim proxy → any global city → custom-point forecast |
 | `POST /api/keys` `{tomtom, openweather}` | Runtime keys (memory only) → flips sim → live |
 | `GET /api/tiles` | TomTom raster tile URL template (when key set) |
-| `GET /api/corridor?olat=&olon=&dlat=&dlon=` | 🛣 Free routing (TomTom live or haversine) + mid-corridor prediction + advice |
+| `GET /api/corridor?…&alts=2` | 🛣 Path options (TomTom maxAlternatives live, else Fastest/Shortest synth) + midpoint prediction + advice |
 | `GET /api/grid?city=&horizon=` | 9-point telemetry grid for map overlay |
 | `GET /api/model` | Active model backend/metrics/custom flag |
 | `POST /api/retrain` (CSV + trees/depth/lr) | 🧠 In-app retrain → swaps live bundle |

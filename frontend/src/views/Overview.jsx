@@ -24,7 +24,7 @@ export default function Overview({ data, forecast, city, route, rain, holiday, g
   useEffect(() => {
     if (city && route) api.insight(city, route).then(setInsight).catch(() => {})
   }, [city, route])
-  if (!data) return <p>Loading…</p>
+  if (!data || !data.pred || !data.flow) return <p>Loading overview data…</p>
   const { flow, weather, pred, colors, shap } = data
   const lvl = pred.final_level
   const verdict = verdictOf(forecast?.rows, lvl)
@@ -34,7 +34,7 @@ export default function Overview({ data, forecast, city, route, rain, holiday, g
         <div className="alert">🚨 SEVERE congestion — consider an alternate route.</div>
       )}
       <div className="cards">
-        <div className="card"><h4>Live Now · congestion</h4><div className="bignum"><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} /><span className="unit">%</span></div><GaugeNeedle ratio={flow.congestion_ratio} /></div>
+        <div className="card"><h4>Live Now · congestion</h4><div className="bignum"><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} /><span className="unit">% congested</span></div><GaugeNeedle ratio={flow.congestion_ratio} /><span className="sub">fluidity {Math.round(flow.congestion_ratio * 100)}% of free-flow speed</span></div>
         <div className="card"><h4>Live speed</h4><div className="bignum"><CountUp value={flow.current_speed} /><span className="unit">km/h</span></div><span className="sub">free {flow.free_flow_speed} · {flow.congestion_ratio < 0.5 ? 'jammed' : 'flowing'}</span></div>
         <div className="card"><h4>Predicted volume</h4><div className="bignum"><CountUp value={pred.final_vol} /><span className="unit">veh/hr</span></div><span className="sub">{lvl} · delay +{flow.delay_min} min</span></div>
         <div className="card"><h4>Weather</h4><div className="bignum">{(weather.temp - 273.15).toFixed(0)}<span className="unit">°C · {weather.weather_main}</span></div><span className="sub">rain {weather.rain_1h} mm/h · clouds {weather.clouds_all}%</span></div>

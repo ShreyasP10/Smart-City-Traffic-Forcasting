@@ -1,9 +1,9 @@
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 export default function Adaptation({ data }) {
-  if (!data) return <p>Loading…</p>
-  const m = data.metrics
-  const drop = m.calib_mae_unadapted ? ((1 - m.calib_mae_adapted / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
+  if (!data || !data.metrics || !data.stages) return <p>Loading adaptation data…</p>
+  const m = data.metrics || {}
+  const drop = m.calib_mae_unadapted ? ((1 - (m.calib_mae_adapted || 0) / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
   return (
     <div>
       <h3>🔁 Cross-context adaptation: US base → Indian city</h3>

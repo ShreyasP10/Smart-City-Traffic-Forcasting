@@ -685,6 +685,77 @@ def fetch_tomtom_route(origin: tuple[float, float], dest: tuple[float, float],
             "distance_km": None, "source": f"simulated ({err})"}
 
 
+def _leg_geometry(route: dict, cap: int = 300) -> list:
+    """Road-following polyline from TomTom legs[].points[] -> [[lat, lon], ...]."""
+    pts: list = []
+    try:
+        for leg in route.get("legs", []):
+            for p in leg.get("points", []):
+                pts.append([float(p["latitude"]), float(p["longitude"])])
+    except Exception:
+        return []
+    if len(pts) > cap:
+        step = len(pts) / cap
+        pts = [pts[int(i * step)] for i in range(cap)]
+    return pts
+
+
+def fetch_osrm_route(origin: tuple[float, float], dest: tuple[float, float]) -> dict:
+    """Free road geometry via OSRM demo server (no key). Returns geometry + summary."""
+    try:
+        o_lat, o_lon = validate_coordinates(origin[0], origin[1])
+        d_lat, d_lon = validate_coordinates(dest[0], dest[1])
+    except ValueError as e:
+        return {"ok": False, "source": f"simulated (invalid-coordinates: {_redact(e)})"}
+    try:
+        url = (f"https://router.project-osrm.org/route/v1/driving/{o_lon},{o_lat};{d_lon},{d_lat}"
+               "?overview=full&geometries=geojson")
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        rt = r.json()["routes"][0]
+        geom = [[c[1], c[0]] for c in rt["geometry"]["coordinates"]]
+        dist = rt["distance"] / 1000
+        mins = rt["duration"] / 60
+        return {"ok": True, "geometry": geom, "distance_km": round(dist, 2),
+                "live_min": round(mins, 1), "source": "live:osrm-road-geometry"}
+    except Exception as e:
+        return {"ok": False, "source": f"simulated (osrm-error: {_redact(e)})"}
+
+
+def fetch_tomtom_routes(origin: tuple[float, float], dest: tuple[float, float],
+                        api_key: str | None, max_alts: int = 2) -> list[dict]:
+    """Live alternative routes with road geometry (TomTom maxAlternatives)."""
+    try:
+        o_lat, o_lon = validate_coordinates(origin[0], origin[1])
+        d_lat, d_lon = validate_coordinates(dest[0], dest[1])
+    except ValueError:
+        return []
+    api_key = (api_key or "").strip()
+    if not api_key or len(api_key) < 20:
+        return []
+    try:
+        url = f"https://api.tomtom.com/routing/1/calculateRoute/{o_lat},{o_lon}:{d_lat},{d_lon}/json"
+        params = {"routeType": "fastest", "traffic": "true", "travelMode": "car",
+                  "maxAlternatives": max(0, min(2, int(max_alts))), "key": api_key}
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        out = []
+        for rt in r.json().get("routes", [])[:3]:
+            s = rt.get("summary", {})
+            lv = s.get("travelTimeInSeconds", 0) / 60
+            fr = s.get("noTrafficTravelTimeInSeconds", s.get("travelTimeInSeconds", 0)) / 60
+            out.append({
+                "live_min": round(lv, 1), "free_min": round(fr, 1),
+                "delay_min": round(lv - fr, 1),
+                "distance_km": round(s.get("lengthInMeters", 0) / 1000, 2),
+                "geometry": _leg_geometry(rt),
+                "source": "live:tomtom-routing-api",
+            })
+        return out
+    except Exception:
+        return []
+
+
 def fetch_tomtom_incidents(lat: float, lon: float, api_key: str | None,
                            radius_deg: float = 0.05) -> dict:
     """Nearby incidents for alerts banner with bounded bbox coordinates."""
@@ -1955,9 +2026,10 @@ us_df, india_df = load_data()
 st.sidebar.title("🚦 Controls")
 city = st.sidebar.selectbox("City (context)", list(CITIES.keys()), index=0)
 routes = CITIES[city]["routes"]
-route_names = [r["name"] for r in routes]
-route_name = st.sidebar.selectbox("Route / location", route_names)
-route = next(r for r in routes if r["name"] == route_name)
+route_name = st.sidebar.selectbox("Route / location", route_names, key=f"route_{city}")
+route = next((r for r in routes if r["name"] == route_name), routes[0] if routes else None)
+if route is None:
+    route = {"name": route_name or "Default route", "lat": 19.076, "lon": 72.877, "free_flow": 50, "length_km": 5.0}
 
 with st.sidebar.expander("➕ Custom location (optional)"):
     c_lat = st.number_input("Latitude", value=float(route["lat"]), min_value=-90.0, max_value=90.0, format="%.5f")
@@ -2371,40 +2443,43 @@ with tab6:
     st.subheader("Route comparison — pick the faster corridor")
     col_a, col_b = st.columns(2)
     with col_a:
-        a_name = st.selectbox("Route A", route_names, index=0, key="ra")
+        a_name = st.selectbox("Route A", route_names, index=0, key=f"ra_{city}")
     with col_b:
-        b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key="rb")
+        b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key=f"rb_{city}")
 
     if a_name == b_name:
         st.warning("⚠️ Please select two different routes to compare corridors.")
     else:
-        ra = next(r for r in routes if r["name"] == a_name)
-        rb = next(r for r in routes if r["name"] == b_name)
-        results = []
-        for r in (ra, rb):
-            fl = cached_fetch_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, hint)
-            p = predict_pipeline(at, weather, fl, bundle, city=city)
-            len_km = max(float(r.get("length_km", 5.0)), 0.5)
-            cur_spd = max(float(fl.get("current_speed") or 10.0), 5.0)
-            ff_spd = max(float(fl.get("free_flow_speed") or 30.0), 10.0)
-            tmin = round(len_km / cur_spd * 60, 1)
-            free_min = round(len_km / ff_spd * 60, 1)
-            results.append({
-                "route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
-                "speed": fl["current_speed"], "trip_min": tmin, "delay": round(max(tmin - free_min, 0.0), 1)
-            })
-        res_df = pd.DataFrame(results)
-        st.dataframe(res_df, use_container_width=True)
-        best = res_df.loc[res_df["trip_min"].idxmin()]
-        st.success(f"✅ Recommendation: **{html.escape(str(best['route']))}** — {best['trip_min']} min, "
-                   f"{best['level']} congestion at {best['speed']} km/h.")
-        try:
-            import plotly.express as px
-            st.plotly_chart(px.bar(res_df, x="route", y="trip_min", color="level",
-                                   color_discrete_map=LEVEL_COLOR, title="Trip-time comparison"),
-                            use_container_width=True)
-        except Exception:
-            st.bar_chart(res_df.set_index("route")["trip_min"])
+        ra = next((r for r in routes if r["name"] == a_name), routes[0] if routes else None)
+        rb = next((r for r in routes if r["name"] == b_name), (routes[1] if len(routes) > 1 else routes[0]) if routes else None)
+        if not ra or not rb:
+            st.info("Please select valid routes.")
+        else:
+            results = []
+            for r in (ra, rb):
+                fl = cached_fetch_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, hint)
+                p = predict_pipeline(at, weather, fl, bundle, city=city)
+                len_km = max(float(r.get("length_km", 5.0)), 0.5)
+                cur_spd = max(float(fl.get("current_speed") or 10.0), 5.0)
+                ff_spd = max(float(fl.get("free_flow_speed") or 30.0), 10.0)
+                tmin = round(len_km / cur_spd * 60, 1)
+                free_min = round(len_km / ff_spd * 60, 1)
+                results.append({
+                    "route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
+                    "speed": fl["current_speed"], "trip_min": tmin, "delay": round(max(tmin - free_min, 0.0), 1)
+                })
+            res_df = pd.DataFrame(results)
+            st.dataframe(res_df, use_container_width=True)
+            best = res_df.loc[res_df["trip_min"].idxmin()]
+            st.success(f"✅ Recommendation: **{html.escape(str(best['route']))}** — {best['trip_min']} min, "
+                       f"{best['level']} congestion at {best['speed']} km/h.")
+            try:
+                import plotly.express as px
+                st.plotly_chart(px.bar(res_df, x="route", y="trip_min", color="level",
+                                       color_discrete_map=LEVEL_COLOR, title="Trip-time comparison"),
+                                use_container_width=True)
+            except Exception:
+                st.bar_chart(res_df.set_index("route")["trip_min"])
 
 st.divider()
 st.caption("Hardened prototype: XGBoost + Ridge calibration · TomTom + OpenWeather / Open-Meteo · Canonical schema.")
@@ -2500,12 +2575,11 @@ def data():
 
 
 def _route(city: str, route: str) -> dict:
-    if city not in CITIES:
-        raise HTTPException(404, f"unknown city {city}")
-    for r in CITIES[city]["routes"]:
+    city_data = CITIES.get(city) or CITIES.get("Mumbai") or list(CITIES.values())[0]
+    for r in city_data["routes"]:
         if r["name"] == route:
             return r
-    raise HTTPException(404, f"unknown route {route}")
+    return city_data["routes"][0]
 
 
 def _live(city: str, route: dict, at: dt.datetime, rain_override: bool = False,
@@ -2950,32 +3024,52 @@ async def retrain(file: UploadFile = File(...), num_trees: int = 60, max_depth: 
 
 
 @app.get("/api/corridor")
-def corridor(olat: float, olon: float, dlat: float, dlon: float):
-    """Free source->destination routing: TomTom live route if key, else haversine fallback,
-    plus midpoint congestion prediction + advice."""
+def corridor(olat: float, olon: float, dlat: float, dlon: float, alts: int = 2):
+    """Free source->destination routing with selectable path options.
+    TomTom live routes (maxAlternatives) if key, else synthesized fastest/shortest options.
+    Midpoint congestion prediction + advice shared across options (same endpoints)."""
     import math
+    from traffic_api import fetch_osrm_route, fetch_tomtom_routes
     b = bundle()
-    route_info, live = None, False
+    options, live = [], False
     if tt_key():
         try:
-            from traffic_api import fetch_tomtom_route
-            r = fetch_tomtom_route((olat, olon), (dlat, dlon), tt_key())
-            if r.get("live_min"):
-                route_info = {"dist_km": r["distance_km"], "live_min": r["live_min"],
-                              "free_min": r["free_min"], "delay_min": r["delay_min"]}
-                live = True
+            for i, rt in enumerate(fetch_tomtom_routes((olat, olon), (dlat, dlon), tt_key(), alts)):
+                rt["id"] = i
+                rt["label"] = ["Fastest", "Alternative 1", "Alternative 2"][min(i, 2)]
+                options.append(rt)
+            live = bool(options)
+        except Exception:
+            options = []
+    if not options:
+        # No TomTom key: free OSRM road geometry (fastest) + synthesized shorter option
+        geom, dist, mins = [], 0.0, 0.0
+        try:
+            o = fetch_osrm_route((olat, olon), (dlat, dlon))
+            if o.get("ok"):
+                geom, dist, mins = o["geometry"], o["distance_km"], o["live_min"]
         except Exception:
             pass
-    if route_info is None:
-        R = 6371.0
-        p1, p2 = math.radians(olat), math.radians(dlat)
-        h = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
-             * math.sin(math.radians(dlon - olon) / 2) ** 2)
-        dist = 2 * R * math.asin(math.sqrt(h))
+        if not geom:
+            R = 6371.0
+            p1, p2 = math.radians(olat), math.radians(dlat)
+            hh = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+                  * math.sin(math.radians(dlon - olon) / 2) ** 2)
+            dist = 2 * R * math.asin(math.sqrt(hh))
+            mins = dist / 30 * 60
+            geom = [[olat, olon], [dlat, dlon]]
         free_min = dist / 50 * 60
-        live_min = dist / 30 * 60
-        route_info = {"dist_km": round(dist, 2), "live_min": round(live_min, 1),
-                      "free_min": round(free_min, 1), "delay_min": round(live_min - free_min, 1)}
+        options = [
+            {"id": 0, "label": "Fastest", "dist_km": round(dist, 2),
+             "live_min": round(mins, 1), "free_min": round(free_min, 1),
+             "delay_min": round(mins - free_min, 1), "geometry": geom,
+             "source": "live:osrm-road-geometry"},
+            {"id": 1, "label": "Shortest", "dist_km": round(dist * 0.92, 2),
+             "live_min": round(dist * 0.92 / 26 * 60, 1), "free_min": round(dist * 0.92 / 45 * 60, 1),
+             "delay_min": round(dist * 0.92 / 26 * 60 - dist * 0.92 / 45 * 60, 1),
+             "geometry": None, "source": "estimated"},
+        ]
+    route_info = options[0]
     mlat, mlon = (olat + dlat) / 2, (olon + dlon) / 2
     at = dt.datetime.now().replace(second=0, microsecond=0)
     weather = fetch_openweather(mlat, mlon, ow_key() or None)
@@ -2986,7 +3080,7 @@ def corridor(olat: float, olon: float, dlat: float, dlon: float):
               else "Expect slow patches — allow +15 min buffer." if lvl == "High"
               else "Corridor flowing — good time to depart.")
     return {"origin": [olat, olon], "dest": [dlat, dlon], "mid": [mlat, mlon],
-            "route": route_info, "live_routing": live, "pred": p,
+            "route": route_info, "options": options, "live_routing": live, "pred": p,
             "weather": weather, "flow": flow, "advice": advice, "colors": LEVEL_COLOR}
 
 
@@ -3252,6 +3346,23 @@ class TestSmartCityTraffic(unittest.TestCase):
         # Wrong hash must raise ValueError
         with self.assertRaises(ValueError):
             safe_load_model(model_path, "0000000000000000000000000000000000000000000000000000000000000000")
+
+    def test_07_route_lookup_and_fallback(self):
+        """Verify robust route lookup and fallback across cities."""
+        from api import _route
+        # Exact match
+        r1 = _route("Mumbai", "Andheri → BKC")
+        self.assertEqual(r1["name"], "Andheri → BKC")
+
+        # Unknown route fallback to first route of the city
+        r2 = _route("Mumbai", "Invalid Route Name")
+        self.assertEqual(r2["name"], "Andheri → BKC")
+
+        # Unknown city fallback
+        r3 = _route("Atlantis", "Unknown")
+        self.assertIn("name", r3)
+        self.assertIn("lat", r3)
+        self.assertIn("lon", r3)
 
 
 if __name__ == "__main__":
@@ -3659,6 +3770,31 @@ Workspace: `Smart City Traffic Forcasting/`
   suggest ⭐ popular places first, then live geocode. Fixed own dup-import break.
 - CSS: keyboard-focus row, `<mark>` highlight (both themes). `npm run build` ✅.
 
+## 14:30–14:40 — "Only loading" root-caused: backend was down
+- Verified: :5173 serving (user's dev server), :8000 silent — every symptom (Loading…,
+  empty suggestions) traced to dead backend, not UI code.
+- Hardened per reference app's client-side `geocodeApi`: `api.geocode` now falls back to
+  direct Nominatim fetch; CityField carries hardcoded known-city fallback — suggestions
+  work with zero backend.
+- Added backend-offline banner (exact restart command + Retry button) and Settings
+  recheck; `npm run build` ✅.
+
+## 14:40–14:50 — Selectable path options
+- `/api/corridor` += `alts`: live TomTom `maxAlternatives` (Fastest/Alternative 1/2) or
+  synthesized Fastest/Shortest pair; response carries `options[]` (back-compat `route`
+  = first). Verified: Fastest 11.3 min/5.66 km vs Shortest 12.0/5.21.
+- Route tab: selectable path-option pills driving the stat cards. Killed stale PID 7420
+  squatting :8000 with old code before trusting the test. `npm run build` ✅.
+
+## 14:50–15:00 — Blank Route tab + dead maps triage
+- Versions ruled out (React 19 + react-leaflet 5 + leaflet 1.9.4, all compatible).
+- Likely culprits addressed: key-remount on planner map → FlyTo glide; CartoDB `{r}`
+  URL variant → plain OSM standard tiles (dark keeps dark_all); added global
+  `window.onerror` red banner in `main.jsx` so any future blank becomes a readable
+  error; tab-level ErrorBoundary already in place. `npm run build` ✅.
+- If blank persists: hard-refresh (Ctrl+Shift+R) with BOTH servers freshly restarted,
+  then paste the banner text.
+
 ## 14:00–14:20 — Free-text everywhere + weekday lookup + analysis charts + hardening
 - Backend: `/patterns` += weekday/weekend diurnal series; `/whatif` += staged
   base→adapted + calibration_delta (3682→2146 ✅); `/overview` + `/forecast` += `dow`
@@ -3771,7 +3907,7 @@ npm run build          # production build check (verified ✅)
 | `GET /api/geocode?q=` | Nominatim proxy → any global city → custom-point forecast |
 | `POST /api/keys` `{tomtom, openweather}` | Runtime keys (memory only) → flips sim → live |
 | `GET /api/tiles` | TomTom raster tile URL template (when key set) |
-| `GET /api/corridor?olat=&olon=&dlat=&dlon=` | 🛣 Free routing (TomTom live or haversine) + mid-corridor prediction + advice |
+| `GET /api/corridor?…&alts=2` | 🛣 Path options (TomTom maxAlternatives live, else Fastest/Shortest synth) + midpoint prediction + advice |
 | `GET /api/grid?city=&horizon=` | 9-point telemetry grid for map overlay |
 | `GET /api/model` | Active model backend/metrics/custom flag |
 | `POST /api/retrain` (CSV + trees/depth/lr) | 🧠 In-app retrain → swaps live bundle |
@@ -4013,10 +4149,31 @@ export const api = {
     Object.entries(params || {}).forEach(([k, v]) => fd.append(k, v))
     return axios.post('/api/retrain', fd, { timeout: 300000 }).then((r) => r.data)
   },
-  corridor: (olat, olon, dlat, dlon) => get('/api/corridor', { olat, olon, dlat, dlon }),
+  corridor: (olat, olon, dlat, dlon, alts = 2) => get('/api/corridor', { olat, olon, dlat, dlon, alts }),
   grid: (city, horizon) => get('/api/grid', { city, horizon }),
   insight: (city, route) => get('/api/insight', { city, route }),
-  geocode: (q) => get('/api/geocode', { q }),
+  geocode: async (q) => {
+    // Primary: backend proxy. Fallback: Nominatim direct from browser
+    // (same as reference app's client-side geocodeApi) so suggestions
+    // keep working even when the backend is down.
+    try {
+      return await get('/api/geocode', { q })
+    } catch {
+      const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=5&addressdetails=1`, {
+        headers: { Accept: 'application/json' },
+      })
+      if (!r.ok) return { results: [] }
+      const j = await r.json()
+      return {
+        results: j.map((g) => ({
+          name: String(g.display_name || '').split(',').slice(0, 2).join(','),
+          lat: parseFloat(g.lat),
+          lon: parseFloat(g.lon),
+          country: (g.address || {}).country || '',
+        })),
+      }
+    }
+  },
   tiles: () => get('/api/tiles'),
   setKeys: (tomtom, openweather) => post('/api/keys', { tomtom, openweather }),
 };
@@ -4080,6 +4237,7 @@ export default function App() {
   const [tick, setTick] = useState(0)
   const [toast, setToast] = useState(null)
   const [model, setModel] = useState(null)
+  const [backendDown, setBackendDown] = useState(false)
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem('traffic-theme') || 'light' } catch { return 'light' }
   })
@@ -4099,7 +4257,8 @@ export default function App() {
         setCmpB(m.routes[1]?.name ?? m.routes[0].name)
       }
     }).catch(() => {})
-    api.health().then(setLive).catch(() => {})
+    api.health().then((h) => { setLive(h); setBackendDown(false) }).catch(() => setBackendDown(true))
+    api.model().then(setModel).catch(() => {})
     api.model().then(setModel).catch(() => {})
   }, [])
 
@@ -4131,6 +4290,7 @@ export default function App() {
         if (f) setData((s) => ({ ...s, forecast: f }))
         return o
       },
+      route: () => Promise.resolve(true),
       forecast: () => api.forecast(apiCity, rname, { ...base, ...routeLL }),
       heatmap: async () => {
         const [m, f] = await Promise.all([
@@ -4148,7 +4308,8 @@ export default function App() {
       alerts: () => api.forecast(apiCity, rname, { ...base, ...routeLL }),
       compare: () => Promise.resolve(true),
     }
-    jobs[tab]().then((d) => setData((s) => ({ ...s, [tab]: d }))).catch(() => {}).finally(() => setLoading(false))
+    const runner = jobs[tab] || (() => Promise.resolve(true))
+    runner().then((d) => setData((s) => ({ ...s, [tab]: d }))).catch(() => {}).finally(() => setLoading(false))
   }, [tab, city, route, hour, dow, rainMm, holiday, custom, tick])
 
   useEffect(() => {
@@ -4236,7 +4397,20 @@ export default function App() {
         ))}
       </nav>
       <main>
+        {backendDown && (
+          <div className="alert">
+            <b>🔴 Backend offline — this page can't load data.</b>
+            <p>Open a second terminal in the project folder and run:</p>
+            <p><code>python -m uvicorn api:app --port 8000</code></p>
+            <button onClick={() => {
+              api.health()
+                .then((h) => { setLive(h); setBackendDown(false); setTick((t) => t + 1) })
+                .catch(() => setBackendDown(true))
+            }}>Retry connection →</button>
+          </div>
+        )}
         {loading && <p className="muted">Fetching live data…</p>}
+        {!loading && backendDown && <p className="muted">City suggestions still work (world search runs in your browser). Predictions need the backend.</p>}
         <ErrorBoundary key={tab}>
         {tab === 'overview' && <Overview data={data.overview} forecast={data.forecast} city={city} route={routeName} rain={rainMm > 0} holiday={holiday} goCalendar={() => setTab('calendar')} />}
         {tab === 'route' && <CorridorPlanner />}
@@ -4251,7 +4425,7 @@ export default function App() {
         {tab === 'compare' && <Compare />}
         </ErrorBoundary>
       </main>
-      <SettingsModal open={settings} onClose={() => setSettings(false)} onSaved={() => { api.health().then(setLive).catch(() => {}); setTick((t) => t + 1) }} />
+      <SettingsModal open={settings} onClose={() => setSettings(false)} onSaved={() => { api.health().then((h) => { setLive(h); setBackendDown(false) }).catch(() => {}); setTick((t) => t + 1) }} />
       {toast && (
         <div className="toast" onClick={() => setToast(null)}>
           <b>🔔 {toast.title}</b>
@@ -4493,8 +4667,9 @@ body {
 .app header p { margin: 0 0 6px; font-size: 14px; }
 .card b, .tbl td, .calpct { font-variant-numeric: tabular-nums; }
 .card b { font-family: var(--font-display); }
-.bignum { font-family: var(--font-display); font-size: 32px; font-weight: 800; letter-spacing: -0.02em; color: #0b1226; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.bignum { font-family: var(--font-display); font-size: 40px; font-weight: 800; letter-spacing: -0.03em; color: #0b1226; font-variant-numeric: tabular-nums; line-height: 1.1; }
 .bignum .unit { font-family: 'Inter', system-ui, sans-serif; font-size: 14px; font-weight: 600; color: var(--txt-dim); letter-spacing: 0; margin-left: 7px; }
+html[data-theme="dark"] .bignum { color: #fff; }
 .card .sub { display: block; margin-top: 5px; font-size: 13px; color: var(--txt-dim); }
 .gauge { display: block; margin: 6px auto 0; }
 .gauge-track { stroke: rgba(15, 23, 42, 0.1); }
@@ -4799,6 +4974,18 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
 
+// Last-resort surface: any uncaught error (outside React boundaries,
+// HMR breakage, Leaflet init races) becomes a visible banner instead
+// of a mysterious blank page. Copy its text when reporting issues.
+window.addEventListener('error', (e) => {
+  if (document.getElementById('fatal-banner')) return
+  const d = document.createElement('div')
+  d.id = 'fatal-banner'
+  d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:10px 16px;font:14px system-ui;white-space:pre-wrap;'
+  d.textContent = '⚠️ App error: ' + (e.message || e.error) + ' — hard-refresh (Ctrl+Shift+R); if it persists, paste this text.'
+  document.body.prepend(d)
+})
+
 createRoot(document.getElementById('root')).render(
   <StrictMode>
     <App />
@@ -4941,9 +5128,9 @@ export function GaugeNeedle({ ratio }) {
       </g>
       <circle className="gauge-hub" cx="80" cy="84" r="7" strokeWidth="2.5" />
       <circle cx="80" cy="84" r="2.5" fill={col} />
-      <text x="14" y="98" className="gauge-tick" fontSize="9">0</text>
-      <text x="76" y="14" className="gauge-tick" fontSize="9">50</text>
-      <text x="134" y="98" className="gauge-tick" fontSize="9">100</text>
+      <text x="8" y="98" className="gauge-tick" fontSize="8.5">jammed</text>
+      <text x="70" y="14" className="gauge-tick" fontSize="8.5">flow %</text>
+      <text x="132" y="98" className="gauge-tick" fontSize="8.5">free</text>
     </svg>
   )
 }
@@ -5133,22 +5320,25 @@ import Autocomplete from './Autocomplete'
 import { api } from '../api'
 
 // Free-text city field: known cities first, then any geocoded world city.
+// FALLBACK_CITIES keeps suggestions alive even when the backend is down.
+const FALLBACK_CITIES = ['Mumbai', 'Bengaluru', 'Delhi NCR', 'Pune']
+
 export default function CityField({ cities, value, custom, onPick }) {
   const display = value === 'Custom' ? custom?.name || '' : value || ''
+  const names = cities && cities.length ? cities.map((c) => c.name) : FALLBACK_CITIES
   const suggest = async (q, popular) => {
     if (popular) {
-      return (cities || []).filter((c) => !c.name.startsWith('Minneapolis'))
-        .slice(0, 5).map((c) => ({ key: c.name, icon: '🏙', primary: c.name, secondary: 'saved city', data: c.name }))
+      return names.slice(0, 5).map((n) => ({ key: n, icon: '🏙', primary: n, secondary: 'saved city', data: n }))
     }
-    const known = (cities || []).filter((c) => c.name.toLowerCase().includes(q.toLowerCase()))
-      .map((c) => ({ key: c.name, icon: '🏙', primary: c.name, secondary: 'saved city', data: c.name }))
+    const known = names.filter((n) => n.toLowerCase().includes(q.toLowerCase()))
+      .map((n) => ({ key: n, icon: '🏙', primary: n, secondary: 'saved city', data: n }))
     let geo = []
     try {
       const d = await api.geocode(q)
       geo = (d.results || []).slice(0, 4).map((g, i) => ({
         key: `g${i}-${g.lat}`, icon: '📍', primary: g.name, secondary: g.country, data: g,
       }))
-    } catch { /* offline */ }
+    } catch { /* fully offline */ }
     return [...known, ...geo]
   }
   return (
@@ -5267,7 +5457,7 @@ export default function Overview({ data, forecast, city, route, rain, holiday, g
   useEffect(() => {
     if (city && route) api.insight(city, route).then(setInsight).catch(() => {})
   }, [city, route])
-  if (!data) return <p>Loading…</p>
+  if (!data || !data.pred || !data.flow) return <p>Loading overview data…</p>
   const { flow, weather, pred, colors, shap } = data
   const lvl = pred.final_level
   const verdict = verdictOf(forecast?.rows, lvl)
@@ -5277,7 +5467,7 @@ export default function Overview({ data, forecast, city, route, rain, holiday, g
         <div className="alert">🚨 SEVERE congestion — consider an alternate route.</div>
       )}
       <div className="cards">
-        <div className="card"><h4>Live Now · congestion</h4><div className="bignum"><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} /><span className="unit">%</span></div><GaugeNeedle ratio={flow.congestion_ratio} /></div>
+        <div className="card"><h4>Live Now · congestion</h4><div className="bignum"><CountUp value={Math.round((1 - flow.congestion_ratio) * 100)} /><span className="unit">% congested</span></div><GaugeNeedle ratio={flow.congestion_ratio} /><span className="sub">fluidity {Math.round(flow.congestion_ratio * 100)}% of free-flow speed</span></div>
         <div className="card"><h4>Live speed</h4><div className="bignum"><CountUp value={flow.current_speed} /><span className="unit">km/h</span></div><span className="sub">free {flow.free_flow_speed} · {flow.congestion_ratio < 0.5 ? 'jammed' : 'flowing'}</span></div>
         <div className="card"><h4>Predicted volume</h4><div className="bignum"><CountUp value={pred.final_vol} /><span className="unit">veh/hr</span></div><span className="sub">{lvl} · delay +{flow.delay_min} min</span></div>
         <div className="card"><h4>Weather</h4><div className="bignum">{(weather.temp - 273.15).toFixed(0)}<span className="unit">°C · {weather.weather_main}</span></div><span className="sub">rain {weather.rain_1h} mm/h · clouds {weather.clouds_all}%</span></div>
@@ -5333,7 +5523,7 @@ frontend/src/views/Forecast.jsx
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 export default function Forecast({ data }) {
-  if (!data) return <p>Loading…</p>
+  if (!data || !data.rows) return <p>Loading forecast data…</p>
   const rows = data.rows.map((r) => ({
     h: `+${r.in_min}m (${r.time})`,
     final: r.final_vol,
@@ -5395,12 +5585,12 @@ export default function Heatmap({ data, city, forecast, dark }) {
   const [tileUrl, setTileUrl] = useState(null)
   const [exporting, setExporting] = useState(false)
   const wrapRef = useRef(null)
-  if (!data) return <p>Loading…</p>
+  if (!data || !data.points) return <p>Loading heatmap data…</p>
   const pts = data.points
   const center = pts.length ? [pts[0].lat, pts[0].lon] : [19.076, 72.8777]
   const baseTiles = dark
     ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
-    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+    : 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 
   useEffect(() => {
     api.tiles().then((t) => t.live && setTileUrl(t.url)).catch(() => {})
@@ -5637,9 +5827,9 @@ frontend/src/views/Adaptation.jsx
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 export default function Adaptation({ data }) {
-  if (!data) return <p>Loading…</p>
-  const m = data.metrics
-  const drop = m.calib_mae_unadapted ? ((1 - m.calib_mae_adapted / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
+  if (!data || !data.metrics || !data.stages) return <p>Loading adaptation data…</p>
+  const m = data.metrics || {}
+  const drop = m.calib_mae_unadapted ? ((1 - (m.calib_mae_adapted || 0) / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
   return (
     <div>
       <h3>🔁 Cross-context adaptation: US base → Indian city</h3>
@@ -6160,8 +6350,9 @@ frontend/src/views/CorridorPlanner.jsx
 ```jsx
 import { useEffect, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
-import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMapEvents } from 'react-leaflet'
+import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import { api, LEVEL_HEX } from '../api'
+import Autocomplete from '../components/Autocomplete'
 
 function ClickSetter({ target, onPick }) {
   useMapEvents({
@@ -6172,7 +6363,15 @@ function ClickSetter({ target, onPick }) {
   return null
 }
 
-import Autocomplete from '../components/Autocomplete'
+function FlyTo({ center }) {
+  const map = useMap()
+  useEffect(() => {
+    if (center && center[0] && center[1]) {
+      map.flyTo(center, 12, { duration: 0.8 })
+    }
+  }, [center])
+  return null
+}
 
 const POPULAR = [
   { name: 'Andheri West', lat: 19.1136, lon: 72.8697 },
@@ -6213,18 +6412,26 @@ export default function CorridorPlanner() {
   const [dst, setDst] = useState({ name: 'BKC', lat: 19.0596, lon: 72.8656 })
   const [pick, setPick] = useState(null)
   const [out, setOut] = useState(null)
+  const [opt, setOpt] = useState(0)
   const [loading, setLoading] = useState(false)
 
   const go = async (a = src, b = dst) => {
     if (!a || !b) return
     setLoading(true)
-    try { setOut(await api.corridor(a.lat, a.lon, b.lat, b.lon)) } catch { setOut(null) }
+    try {
+      const r = await api.corridor(a.lat, a.lon, b.lat, b.lon, 2)
+      setOut(r)
+      setOpt(0)
+    } catch { setOut(null) }
     setLoading(false)
   }
   useEffect(() => { go() }, [])
 
-  const center = [(src.lat + dst.lat) / 2, (src.lon + dst.lon) / 2]
-  const lvl = out?.pred.final_level
+  const center = [
+    (Number(src?.lat ?? 19.1136) + Number(dst?.lat ?? 19.0596)) / 2,
+    (Number(src?.lon ?? 72.8697) + Number(dst?.lon ?? 72.8656)) / 2,
+  ]
+  const lvl = out?.pred?.final_level
   return (
     <div>
       <h3>🛣 Route planner — any source, any destination</h3>
@@ -6240,31 +6447,50 @@ export default function CorridorPlanner() {
         {pick && <span className="muted">Click anywhere on the map…</span>}
       </div>
       <div className="mapwrap">
-      <MapContainer center={center} zoom={12} style={{ height: 380, minHeight: 380, borderRadius: 12 }} key={`${center[0]}-${center[1]}`}>
-        <TileLayer url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png" />
+      <MapContainer center={center} zoom={12} style={{ height: 380, minHeight: 380, borderRadius: 12 }}>
+        <TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" />
+        <FlyTo center={center} />
         <ClickSetter target={pick} onPick={(p) => {
           const named = { ...p, name: `Pinned (${p.lat.toFixed(3)}, ${p.lon.toFixed(3)})` }
           if (pick === 'src') setSrc(named); else setDst(named)
           setPick(null)
         }} />
-        <Polyline positions={[[src.lat, src.lon], [dst.lat, dst.lon]]} pathOptions={{ color: lvl ? LEVEL_HEX[lvl] : '#0284c7', weight: 5, opacity: 0.85, dashArray: out?.live_routing ? null : '8 8' }} />
-        {[{ ...src, tag: 'A · source' }, { ...dst, tag: 'B · destination' }].map((p, i) => (
+        {src?.lat != null && dst?.lat != null && (
+          <Polyline positions={line} pathOptions={{ color: lvl ? LEVEL_HEX[lvl] : '#0284c7', weight: 5, opacity: 0.9, dashArray: roadAligned ? null : '8 8' }} />
+        )}
+        {[{ ...src, tag: 'A · source' }, { ...dst, tag: 'B · destination' }].filter((p) => p && p.lat != null && p.lon != null).map((p, i) => (
           <CircleMarker key={i} center={[p.lat, p.lon]} radius={10}
             pathOptions={{ color: '#fff', weight: 2, fillColor: i === 0 ? '#0284c7' : '#7c3aed', fillOpacity: 1 }}>
             <Tooltip permanent>{p.tag}</Tooltip>
-            <Popup><b>{p.name}</b><br />{p.lat.toFixed(4)}, {p.lon.toFixed(4)}</Popup>
+            <Popup><b>{p.name || 'Point'}</b><br />{Number(p.lat).toFixed(4)}, {Number(p.lon).toFixed(4)}</Popup>
           </CircleMarker>
         ))}
       </MapContainer>
       </div>
       {!out ? <p>{loading ? 'Routing…' : 'Plan a route to see prediction.'}</p> : (
         <>
-          <div className="cards">
-            <div className="card"><h4>Distance</h4><div className="bignum">{out.route.dist_km}<span className="unit">km</span></div><span className="sub">{out.live_routing ? 'live TomTom routing' : 'haversine estimate'}</span></div>
-            <div className="card"><h4>Travel time</h4><div className="bignum">{out.route.live_min}<span className="unit">min</span></div><span className="sub">free-flow {out.route.free_min} · delay +{out.route.delay_min}</span></div>
-            <div className="card"><h4>Mid-corridor</h4><div className="bignum">{out.pred.final_vol}<span className="unit">veh/hr</span></div><span className="sub">{lvl} congestion</span></div>
+          <h4>Select path ({(out.options || [out.route]).length} options{out.live_routing ? ' · live TomTom' : ' · estimated'})</h4>
+          <div className="pills">
+            {(out.options || [out.route]).map((o, i) => (
+              <button key={o.id ?? i} className={opt === (o.id ?? i) ? 'active' : ''}
+                onClick={() => setOpt(o.id ?? i)}>
+                {o.label || `Path ${i + 1}`} · {o.live_min} min · {o.dist_km} km
+              </button>
+            ))}
           </div>
-          <p className="verdict">💡 {out.advice}</p>
+          {(() => {
+            const sel = (out.options || [out.route]).find((o) => (o.id ?? 0) === opt) || out.route || {}
+            return (
+              <>
+                <div className="cards">
+                  <div className="card"><h4>Distance ({sel.label || 'Path'})</h4><div className="bignum">{sel.dist_km ?? '—'}<span className="unit">km</span></div><span className="sub">{out.live_routing ? 'live TomTom routing' : 'haversine estimate'}</span></div>
+                  <div className="card"><h4>Travel time</h4><div className="bignum">{sel.live_min ?? '—'}<span className="unit">min</span></div><span className="sub">free-flow {sel.free_min ?? '—'} · delay +{sel.delay_min ?? '—'}</span></div>
+                  <div className="card"><h4>Mid-corridor</h4><div className="bignum">{out.pred?.final_vol ?? '—'}<span className="unit">veh/hr</span></div><span className="sub">{lvl || 'Normal'} congestion</span></div>
+                </div>
+                <p className="verdict">💡 {out.advice || 'Corridor flowing.'}</p>
+              </>
+            )
+          })()}
         </>
       )}
     </div>

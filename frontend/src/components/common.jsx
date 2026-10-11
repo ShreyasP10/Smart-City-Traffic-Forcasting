@@ -57,9 +57,9 @@ export function GaugeNeedle({ ratio }) {
       </g>
       <circle className="gauge-hub" cx="80" cy="84" r="7" strokeWidth="2.5" />
       <circle cx="80" cy="84" r="2.5" fill={col} />
-      <text x="14" y="98" className="gauge-tick" fontSize="9">0</text>
-      <text x="76" y="14" className="gauge-tick" fontSize="9">50</text>
-      <text x="134" y="98" className="gauge-tick" fontSize="9">100</text>
+      <text x="8" y="98" className="gauge-tick" fontSize="8.5">jammed</text>
+      <text x="70" y="14" className="gauge-tick" fontSize="8.5">flow %</text>
+      <text x="132" y="98" className="gauge-tick" fontSize="8.5">free</text>
     </svg>
   )
 }

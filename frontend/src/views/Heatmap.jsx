@@ -20,12 +20,12 @@ export default function Heatmap({ data, city, forecast, dark }) {
   const [tileUrl, setTileUrl] = useState(null)
   const [exporting, setExporting] = useState(false)
   const wrapRef = useRef(null)
-  if (!data) return <p>Loading…</p>
+  if (!data || !data.points) return <p>Loading heatmap data…</p>
   const pts = data.points
   const center = pts.length ? [pts[0].lat, pts[0].lon] : [19.076, 72.8777]
   const baseTiles = dark
     ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
-    : 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png'
+    : 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 
   useEffect(() => {
     api.tiles().then((t) => t.live && setTileUrl(t.url)).catch(() => {})

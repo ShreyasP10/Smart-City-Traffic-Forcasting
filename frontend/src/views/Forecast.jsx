@@ -1,7 +1,7 @@
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 export default function Forecast({ data }) {
-  if (!data) return <p>Loading…</p>
+  if (!data || !data.rows) return <p>Loading forecast data…</p>
   const rows = data.rows.map((r) => ({
     h: `+${r.in_min}m (${r.time})`,
     final: r.final_vol,

@@ -270,6 +270,77 @@ def fetch_tomtom_route(origin: tuple[float, float], dest: tuple[float, float],
             "distance_km": None, "source": f"simulated ({err})"}
 
 
+def _leg_geometry(route: dict, cap: int = 300) -> list:
+    """Road-following polyline from TomTom legs[].points[] -> [[lat, lon], ...]."""
+    pts: list = []
+    try:
+        for leg in route.get("legs", []):
+            for p in leg.get("points", []):
+                pts.append([float(p["latitude"]), float(p["longitude"])])
+    except Exception:
+        return []
+    if len(pts) > cap:
+        step = len(pts) / cap
+        pts = [pts[int(i * step)] for i in range(cap)]
+    return pts
+
+
+def fetch_osrm_route(origin: tuple[float, float], dest: tuple[float, float]) -> dict:
+    """Free road geometry via OSRM demo server (no key). Returns geometry + summary."""
+    try:
+        o_lat, o_lon = validate_coordinates(origin[0], origin[1])
+        d_lat, d_lon = validate_coordinates(dest[0], dest[1])
+    except ValueError as e:
+        return {"ok": False, "source": f"simulated (invalid-coordinates: {_redact(e)})"}
+    try:
+        url = (f"https://router.project-osrm.org/route/v1/driving/{o_lon},{o_lat};{d_lon},{d_lat}"
+               "?overview=full&geometries=geojson")
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        rt = r.json()["routes"][0]
+        geom = [[c[1], c[0]] for c in rt["geometry"]["coordinates"]]
+        dist = rt["distance"] / 1000
+        mins = rt["duration"] / 60
+        return {"ok": True, "geometry": geom, "distance_km": round(dist, 2),
+                "live_min": round(mins, 1), "source": "live:osrm-road-geometry"}
+    except Exception as e:
+        return {"ok": False, "source": f"simulated (osrm-error: {_redact(e)})"}
+
+
+def fetch_tomtom_routes(origin: tuple[float, float], dest: tuple[float, float],
+                        api_key: str | None, max_alts: int = 2) -> list[dict]:
+    """Live alternative routes with road geometry (TomTom maxAlternatives)."""
+    try:
+        o_lat, o_lon = validate_coordinates(origin[0], origin[1])
+        d_lat, d_lon = validate_coordinates(dest[0], dest[1])
+    except ValueError:
+        return []
+    api_key = (api_key or "").strip()
+    if not api_key or len(api_key) < 20:
+        return []
+    try:
+        url = f"https://api.tomtom.com/routing/1/calculateRoute/{o_lat},{o_lon}:{d_lat},{d_lon}/json"
+        params = {"routeType": "fastest", "traffic": "true", "travelMode": "car",
+                  "maxAlternatives": max(0, min(2, int(max_alts))), "key": api_key}
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        out = []
+        for rt in r.json().get("routes", [])[:3]:
+            s = rt.get("summary", {})
+            lv = s.get("travelTimeInSeconds", 0) / 60
+            fr = s.get("noTrafficTravelTimeInSeconds", s.get("travelTimeInSeconds", 0)) / 60
+            out.append({
+                "live_min": round(lv, 1), "free_min": round(fr, 1),
+                "delay_min": round(lv - fr, 1),
+                "distance_km": round(s.get("lengthInMeters", 0) / 1000, 2),
+                "geometry": _leg_geometry(rt),
+                "source": "live:tomtom-routing-api",
+            })
+        return out
+    except Exception:
+        return []
+
+
 def fetch_tomtom_incidents(lat: float, lon: float, api_key: str | None,
                            radius_deg: float = 0.05) -> dict:
     """Nearby incidents for alerts banner with bounded bbox coordinates."""
