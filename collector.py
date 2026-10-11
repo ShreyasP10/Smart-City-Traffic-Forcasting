@@ -35,31 +35,38 @@ FIELDNAMES = ["timestamp", "location", "lat", "lon", "current_speed", "free_flow
               "traffic_source", "weather_source"]
 
 
-def _parse_simple_kv(path: str) -> dict:
-    out = {}
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                out[k.strip()] = v.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        pass
-    return out
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 
 def load_keys() -> tuple[str, str]:
     base = os.path.dirname(__file__)
     file_keys = {}
-    file_keys.update(_parse_simple_kv(os.path.join(base, ".streamlit", "secrets.toml")))
-    file_keys.update(_parse_simple_kv(os.path.join(base, ".env")))
+    sec_file = os.path.join(base, ".streamlit", "secrets.toml")
+    if os.path.exists(sec_file):
+        try:
+            with open(sec_file, "rb") as f:
+                file_keys.update(tomllib.load(f))
+        except Exception:
+            pass
+    env_file = os.path.join(base, ".env")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file) as f:
+                for line in f:
+                    if "=" in line and not line.strip().startswith("#"):
+                        k, v = line.strip().split("=", 1)
+                        file_keys[k.strip()] = v.strip().strip('"').strip("'")
+        except Exception:
+            pass
+
     tt = (os.environ.get("TOMTOM_API_KEY") or os.environ.get("TOMTOM_KEY")
           or file_keys.get("TOMTOM_API_KEY") or file_keys.get("TOMTOM_KEY") or "")
     ow = (os.environ.get("OPENWEATHER_API_KEY") or os.environ.get("OPENWEATHER_KEY")
           or file_keys.get("OPENWEATHER_API_KEY") or file_keys.get("OPENWEATHER_KEY") or "")
-    return tt.strip(), ow.strip()
+    return str(tt).strip(), str(ow).strip()
 
 
 def collect_once(tt_key: str, ow_key: str) -> list[dict]:

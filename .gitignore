@@ -11,6 +11,9 @@ __pycache__/
 # Temporary & cache files
 .pytest_cache/
 last_response.json
+data/*_cache.json
+*.tmp
+data/indian_realtime.csv
 
 # Virtual environments
 venv/

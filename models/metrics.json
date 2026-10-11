@@ -1,13 +1,16 @@
 {
-  "base_mae": 253.59519958496094,
-  "base_rmse": 438.4344484925882,
-  "calib_mae_adapted": 594.6318400275517,
-  "calib_mae_unadapted": 2220.17431640625,
+  "base_mae": 285.7474365234375,
+  "base_rmse": 508.3319996567204,
+  "calib_mae_adapted": 603.9759944505907,
+  "calib_mae_unadapted": 2240.50537109375,
   "n_us": 48204,
   "n_india_calib": 336,
+  "n_india_train": 235,
+  "n_india_val": 101,
+  "p95_volume": 6200.0,
   "thresholds": [
-    1191.5,
-    3371.0,
-    4932.0
+    1186.5,
+    3378.0,
+    4939.0
   ]
 }

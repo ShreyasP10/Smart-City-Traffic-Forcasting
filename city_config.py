@@ -1,9 +1,19 @@
 """City / route presets for Indian context + US source context.
 
-Each route has: name, lat, lon, free_flow_speed (km/h), length_km
-Free-flow speeds are realistic urban arterial values.
+Includes timezone mapping and canonical holiday rules.
 """
 from __future__ import annotations
+
+import datetime as dt
+from zoneinfo import ZoneInfo
+
+CITY_TZ: dict[str, str] = {
+    "Mumbai": "Asia/Kolkata",
+    "Bengaluru": "Asia/Kolkata",
+    "Delhi NCR": "Asia/Kolkata",
+    "Pune": "Asia/Kolkata",
+    "Minneapolis (Source / US)": "America/Chicago",
+}
 
 CITIES: dict[str, dict] = {
     "Mumbai": {
@@ -50,16 +60,28 @@ CITIES: dict[str, dict] = {
     },
 }
 
-# Coarse Indian public holidays (month, day) for feature engineering.
 INDIAN_HOLIDAYS = {
     (1, 26),   # Republic Day
+    (5, 1),    # Labour Day / Maharashtra Day
     (8, 15),   # Independence Day
     (10, 2),   # Gandhi Jayanti
-    (11, 1),   # Diwali approx (demo)
+    (11, 1),   # Diwali approx
     (12, 25),  # Christmas
-    (5, 1),    # Labour Day (demo)
 }
 
 US_HOLIDAYS = {
-    (1, 1), (7, 4), (11, 24), (12, 25), (5, 30), (9, 5),
+    (1, 1), (5, 30), (7, 4), (9, 5), (11, 24), (12, 25),
 }
+
+
+def is_holiday(d: dt.date | dt.datetime, city: str = "Mumbai") -> int:
+    """Returns 1 if date is a holiday in given city, else 0."""
+    key = (d.month, d.day)
+    holidays = US_HOLIDAYS if "Minneapolis" in city or "US" in city else INDIAN_HOLIDAYS
+    return int(key in holidays)
+
+
+def get_city_now(city: str = "Mumbai") -> dt.datetime:
+    """Returns local time for specified city, preventing UTC displacement on cloud hosts."""
+    tz_str = CITY_TZ.get(city, "Asia/Kolkata")
+    return dt.datetime.now(ZoneInfo(tz_str)).replace(second=0, microsecond=0, tzinfo=None)

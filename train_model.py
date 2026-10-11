@@ -1,20 +1,15 @@
-"""Train base + calibration (transfer-learning) models.
+"""Train base + calibration (transfer-learning) models with chronological split.
 
-Stage 1 (base): HistGradientBoostingRegressor on US historical data.
-Stage 2 (adaptation): Ridge regression stacking on a SMALL India sample that maps
-    [base_pred, rain, hour, is_peak] -> india_volume. This is the calibration /
-    transfer-learning step demonstrable in the dashboard (base vs adapted).
-
-Run:  python train_model.py
-Outputs: models/traffic_model.joblib, models/metrics.json, data/*.csv
+Enforces zero temporal leakage and canonical schema from schema.py.
+Outputs: models/traffic_model.joblib, models/metrics.json, models/checksums.json
 """
 from __future__ import annotations
 
 import json
 import os
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
 try:
     from xgboost import XGBRegressor
     _HAS_XGB = True
@@ -23,46 +18,29 @@ except ImportError:
     _HAS_XGB = False
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
 
+from schema import FEATURES, WEATHER_CODE, add_features, compute_sha256
 from data_generator import load_historical
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
-FEATURES = ["hour", "day_of_week", "month", "is_weekend", "is_holiday",
-            "temp", "rain_1h", "snow_1h", "clouds_all", "weather_code",
-            "is_peak", "is_night"]
-
-WEATHER_CODE = {"Clear": 0, "Clouds": 1, "Mist": 2, "Fog": 2, "Drizzle": 3,
-                "Rain": 4, "Snow": 5, "Thunderstorm": 6}
-
-
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["weather_code"] = df["weather_main"].map(WEATHER_CODE).fillna(1).astype(int)
-    df["is_peak"] = df["hour"].apply(lambda h: int(h in (7, 8, 9, 10, 17, 18, 19, 20, 21))).astype(int)
-    df["is_night"] = df["hour"].apply(lambda h: int(h < 5 or h >= 23)).astype(int)
-    return df
-
-
-def volume_to_level(v: float, thresholds: list[float]) -> str:
-    q25, q50, q75 = thresholds
-    if v < q25:
-        return "Low"
-    if v < q50:
-        return "Moderate"
-    if v < q75:
-        return "High"
-    return "Severe"
 
 
 def main() -> None:
     os.makedirs(MODEL_DIR, exist_ok=True)
     us = add_features(load_historical(indian_style=False))
-    india_small = add_features(load_historical(indian_style=True)).iloc[:24 * 14].copy()  # 14 days
+    # Strict chronological sort
+    if "date_time" in us.columns:
+        us = us.sort_values("date_time").reset_index(drop=True)
+
+    india_small = add_features(load_historical(indian_style=True)).iloc[:24 * 14].copy()
 
     X = us[FEATURES].to_numpy()
     y = us["traffic_volume"].to_numpy()
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=True)
+
+    # Strict chronological split: past 80% trains, future 20% tests (no temporal leakage)
+    split_idx = int(len(X) * 0.8)
+    Xtr, Xte = X[:split_idx], X[split_idx:]
+    ytr, yte = y[:split_idx], y[split_idx:]
 
     if _HAS_XGB:
         base = XGBRegressor(n_estimators=300, max_depth=6, learning_rate=0.05,
@@ -80,23 +58,35 @@ def main() -> None:
     thresholds = [q25, q50, q75]
 
     # ---- Stage 2: calibration on small India sample (transfer learning) ----
-    X_ind = india_small[FEATURES].to_numpy()
-    y_ind = india_small["traffic_volume"].to_numpy()
-    base_on_india = base.predict(X_ind)
-    cal_X = np.column_stack([
-        base_on_india,
-        india_small["rain_1h"].to_numpy(),
-        india_small["hour"].to_numpy(),
-        india_small["is_peak"].to_numpy(),
+    # Enforce honest 70/30 chronological out-of-time split: fit on first 70%, evaluate strictly on held-out 30%
+    cut = int(len(india_small) * 0.7)
+    ind_tr, ind_val = india_small.iloc[:cut], india_small.iloc[cut:]
+
+    base_tr = base.predict(ind_tr[FEATURES].to_numpy())
+    cal_X_tr = np.column_stack([
+        base_tr,
+        ind_tr["rain_1h"].to_numpy(),
+        ind_tr["hour"].to_numpy(),
+        ind_tr["is_peak"].to_numpy(),
     ])
     calib = Ridge(alpha=1.0)
-    calib.fit(cal_X, y_ind)
-    adap_pred = calib.predict(cal_X)
-    mae_adap = float(mean_absolute_error(y_ind, adap_pred))
-    mae_unadap = float(mean_absolute_error(y_ind, base_on_india))
+    calib.fit(cal_X_tr, ind_tr["traffic_volume"].to_numpy())
+
+    # Honest out-of-time validation metrics on held-out 30%
+    base_val = base.predict(ind_val[FEATURES].to_numpy())
+    cal_X_val = np.column_stack([
+        base_val,
+        ind_val["rain_1h"].to_numpy(),
+        ind_val["hour"].to_numpy(),
+        ind_val["is_peak"].to_numpy(),
+    ])
+    adap_val = calib.predict(cal_X_val)
+    mae_adap = float(mean_absolute_error(ind_val["traffic_volume"], adap_val))
+    mae_unadap = float(mean_absolute_error(ind_val["traffic_volume"], base_val))
+    p95_vol = float(np.percentile(ytr, 95))
 
     importances = None
-    try:  # permutation importance is slow; use built-in gain via feature permutation on sample
+    try:
         from sklearn.inspection import permutation_importance
         r = permutation_importance(base, Xte[:2000], yte[:2000], n_repeats=5, random_state=42)
         importances = {f: float(v) for f, v in zip(FEATURES, r.importances_mean)}
@@ -113,15 +103,29 @@ def main() -> None:
             "base_mae": mae, "base_rmse": rmse,
             "calib_mae_adapted": mae_adap, "calib_mae_unadapted": mae_unadap,
             "n_us": int(len(us)), "n_india_calib": int(len(india_small)),
+            "n_india_train": int(len(ind_tr)), "n_india_val": int(len(ind_val)),
+            "p95_volume": p95_vol,
         },
         "importances": importances,
     }
-    joblib.dump(bundle, os.path.join(MODEL_DIR, "traffic_model.joblib"))
+
+    joblib_path = os.path.join(MODEL_DIR, "traffic_model.joblib")
+    joblib.dump(bundle, joblib_path)
+
+    # Calculate and store model integrity SHA-256
+    sha = compute_sha256(joblib_path)
+    checksums_file = os.path.join(MODEL_DIR, "checksums.json")
+    cur_checksums = json.load(open(checksums_file)) if os.path.exists(checksums_file) else {}
+    cur_checksums["traffic_model.joblib"] = sha
+    with open(checksums_file, "w") as f:
+        json.dump(cur_checksums, f, indent=2)
+
     with open(os.path.join(MODEL_DIR, "metrics.json"), "w") as f:
         json.dump(bundle["metrics"] | {"thresholds": thresholds}, f, indent=2)
-    print(f"Base MAE={mae:.1f} RMSE={rmse:.1f} thresholds={[round(t) for t in thresholds]}")
+
+    print(f"Base Chronological MAE={mae:.1f} RMSE={rmse:.1f} thresholds={[round(t) for t in thresholds]}")
     print(f"Transfer: unadapted MAE={mae_unadap:.1f} -> adapted MAE={mae_adap:.1f}")
-    print("Saved models/traffic_model.joblib")
+    print(f"Saved {joblib_path} (SHA-256: {sha[:12]}...)")
 
 
 if __name__ == "__main__":

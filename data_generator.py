@@ -48,9 +48,9 @@ def generate_synthetic(
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
 
     # Holidays: fixed list + random Sundays-as-holiday noise
-    from city_config import INDIAN_HOLIDAYS, US_HOLIDAYS
-    hol = INDIAN_HOLIDAYS if indian_style else US_HOLIDAYS
-    df["is_holiday"] = df["date_time"].apply(lambda t: int((t.month, t.day) in hol)).astype(int)
+    from city_config import is_holiday
+    city_tag = "Mumbai" if indian_style else "Minneapolis"
+    df["is_holiday"] = df["date_time"].apply(lambda t: is_holiday(t, city_tag)).astype(int)
     df["holiday"] = np.where(df["is_holiday"] == 1, "Holiday", "None")
 
     # Weather simulation with seasonal + monsoon character
@@ -93,14 +93,20 @@ def generate_synthetic(
 def load_historical(indian_style: bool = False) -> pd.DataFrame:
     """Load UCI CSV if available else synthetic. Caches synthetic to data/."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(UCI_PATH) and not indian_style:
-        df = pd.read_csv(UCI_PATH)
+    csv_candidates = [
+        UCI_PATH,
+        "Metro_Interstate_Traffic_Volume.csv",
+        os.path.join(DATA_DIR, "Metro_Interstate_Traffic_Volume.csv"),
+    ]
+    found_uci = next((p for p in csv_candidates if os.path.exists(p)), None)
+    if found_uci and not indian_style:
+        df = pd.read_csv(found_uci, keep_default_na=False)
         df["date_time"] = pd.to_datetime(df["date_time"])
         df["hour"] = df["date_time"].dt.hour
         df["day_of_week"] = df["date_time"].dt.dayofweek
         df["month"] = df["date_time"].dt.month
         df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
-        df["is_holiday"] = (df["holiday"] != "None").astype(int)
+        df["is_holiday"] = ((df["holiday"] != "None") & (df["holiday"] != "")).astype(int)
         return df.sort_values("date_time").reset_index(drop=True)
     fname = "synthetic_india.csv" if indian_style else "synthetic_us.csv"
     fpath = os.path.join(DATA_DIR, fname)

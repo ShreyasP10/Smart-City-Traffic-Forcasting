@@ -135,6 +135,16 @@ Workspace: `Smart City Traffic Forcasting/`
 ## 11:20 — README detailed rewrite
 - Expanded from 87-line brief to full detailed README (8 sections): two-terminal quickstart, live-key table, 20-row PS×brownie mapping, architecture diagram + feature lists, honest audit, per-file guide, 7-step demo tour, troubleshooting.
 
+## 12:25 — Metrics re-sync (11:57 retrain changed the numbers)
+- Other session's retrain moved base MAE 252.5→286.3, RMSE 436.9→509.8, thresholds → [1186, 3378, 4939], transfer 2220→595 becomes 2240→604 (still 73% drop), sanity 5649.82→5484.45 (still Severe ✅).
+- Updated README quickstart/table/demo-tour numbers. Older timeline/issues entries keep original figures (accurate at their time).
+
+## 12:15 — Crash triage from your run log (3 fixes, all verified)
+- `requirements.txt` had `"""docstring"""` header lines → pip `Invalid requirement`. Rewrote as pure `#` comments + pins; dropped `shap` (optional fallback exists, heavy Windows build). `pip install -r` now all-satisfied.
+- `app.py:77` `NameError: featurize_point` (other session's import gap) → added to the `from schema import` line.
+- `StreamlitDuplicateElementId` on SHAP `plotly_chart` pairs (Overview 296/300/304, Forecast 358/360) → unique `key=` on all five (`iv_*`, `fc_*`).
+- Verified: headless `streamlit run :8503` serves with zero Traceback/NameError/Duplicate lines. (Remaining `use_container_width` messages are cosmetic deprecation warnings.)
+
 ## 11:00+ — predict.py re-verification (spec re-sent, no changes needed)
 - Re-ran `python predict.py` → same 4 lines, all Moderate (raw 2528→2878, TomTom live + OWM 2.5 live). Checkpoint still pass. Existing hardened `predict.py` already satisfies spec.
 
@@ -165,4 +175,13 @@ Workspace: `Smart City Traffic Forcasting/`
 ## 11:40–11:45 — Codebase Generation (codebase.md)
 - Generated `codebase.md`: single consolidated markdown document containing all project source files, configurations, and documentation formatted with `filename.extension` followed by file content.
 - Updated `README.md`, `timeline.md`, and `issues_log.md` with complete documentation sync.
+
+## 12:00–12:20 — Comprehensive Security, Leakage & Interpretability Audit Hardening
+- Complete audit remediation resolving critical security and methodological findings:
+  - **C1 & C2 (API Secrets Sanitization):** Blanked plaintext tokens in `.streamlit/secrets.toml`, added `.streamlit/secrets.toml.example`, verified `.gitignore`, and built `_redact()` URL/token scrubber in `traffic_api.py`. Converted all HTTP GET requests to `params={}` dictionary structures, eliminating SSRF and parameter injection vectors.
+  - **C3 (Mathematical SHAP Integrity):** Removed invented formula boosters; implemented pure `shap.TreeExplainer` feature attributions; structured the Plotly Waterfall chart to display model SHAP features alongside explicit "India Calibration Delta" and "Live Speed Fusion" stages, ensuring 100% additive equality to the final forecasted volume.
+  - **C4 (Honest Out-of-Time Transfer Split):** Enforced a 70/30 chronological out-of-time split on the Indian corridor dataset, evaluating Ridge adaptation strictly on held-out 30% out-of-sample data (held-out MAE 604.0); clearly distinguished baseline transfer calibration from production ground-truth collection.
+  - **W1 (Zero Temporal Leakage):** Replaced shuffled splits with strict chronological temporal ordering (past 80% train / future 20% test; Out-of-Time MAE 286.26, RMSE 509.83).
+  - **W3, W7, W10 (Unified Prediction Pipeline):** Built `pipeline.py` shared identically across CLI `predict.py` and Streamlit `app.py`. Added physical volume/ratio clipping and exponential horizon decay (`w_live = 0.35 * exp(-m/45)`), resolving flat forward forecasts across T+0..60.
+  - **W5, W6, W8, W9, W11 (Subsystem Isolation & Verification):** Subsystem-isolated caches with atomic `.tmp` replacement, timezone localization via `ZoneInfo`, SHA-256 model integrity verification (`models/checksums.json`), server-side secret loading, and live-only collector visualization.
 

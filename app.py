@@ -1,22 +1,26 @@
 """Smart City Real-Time Traffic Congestion Forecasting & Adaptation — Streamlit dashboard.
 
-Covers all PS requirements:
-  current + predicted + 15/30/60-min forecast | historical patterns |
-  factors influencing prediction | cross-context adaptation (US->India) |
-  heatmap | alerts | route comparison | weather integration.
-Runs offline (simulated live data) or live with TomTom + OpenWeather keys.
+Hardened against:
+- Stored XSS via html.escape on all interpolated user/prediction HTML.
+- SSRF via validate_coordinates on custom latitude/longitude inputs.
+- Unsafe joblib deserialization via safe_load_model with SHA-256 integrity verification.
+- Feature vector drift via canonical schema.featurize_point.
+- Cache file race conditions via isolated data/weather_cache.json with atomic replacement.
+- Redundant API calls via @st.cache_data on route flow fetches.
+- Division-by-zero in travel time and delay calculations.
 """
 from __future__ import annotations
 
 import datetime as dt
+import html
+import json
 import os
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from city_config import CITIES
-from traffic_api import fetch_openweather, fetch_tomtom_flow, contribution_text
+from city_config import CITIES, get_city_now
+from traffic_api import fetch_openweather, fetch_tomtom_flow, contribution_text, validate_coordinates
 from data_generator import load_historical
 from explain_shap import (
     compute_shap_explanation,
@@ -24,8 +28,11 @@ from explain_shap import (
     plot_shap_factor_bars,
     plot_shap_driver_shares,
 )
+from schema import safe_load_model, featurize_point
+from pipeline import predict_pipeline, classify
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "traffic_model.joblib")
+CHECKSUMS_FILE = os.path.join(os.path.dirname(__file__), "models", "checksums.json")
 
 LEVEL_COLOR = {"Low": "#22c55e", "Moderate": "#eab308", "High": "#f97316", "Severe": "#ef4444"}
 LEVEL_ORDER = {"Low": 0, "Moderate": 1, "High": 2, "Severe": 3}
@@ -38,7 +45,13 @@ def load_bundle():
     if not os.path.exists(MODEL_PATH):
         from train_model import main as train_main
         train_main()
-    return joblib.load(MODEL_PATH)
+    expected_sha = None
+    if os.path.exists(CHECKSUMS_FILE):
+        try:
+            expected_sha = json.load(open(CHECKSUMS_FILE)).get(os.path.basename(MODEL_PATH))
+        except Exception:
+            pass
+    return safe_load_model(MODEL_PATH, expected_sha)
 
 
 @st.cache_data
@@ -48,55 +61,9 @@ def load_data():
     return us, india
 
 
-def classify(v, thresholds):
-    q25, q50, q75 = thresholds
-    if v < q25:
-        return "Low"
-    if v < q50:
-        return "Moderate"
-    if v < q75:
-        return "High"
-    return "Severe"
 
 
-def featurize(at: dt.datetime, weather: dict, bundle) -> np.ndarray:
-    wc = bundle["weather_code"].get(weather.get("weather_main", "Clear"), 1)
-    hour = at.hour
-    dow = at.weekday()
-    row = {
-        "hour": hour, "day_of_week": dow, "month": at.month,
-        "is_weekend": int(dow >= 5),
-        "is_holiday": int((at.month, at.day) in {(1, 26), (8, 15), (10, 2), (12, 25), (5, 1), (1, 1), (7, 4)}),
-        "temp": float(weather.get("temp", 300)),
-        "rain_1h": float(weather.get("rain_1h", 0)),
-        "snow_1h": 0.0,
-        "clouds_all": int(weather.get("clouds_all", 20)),
-        "weather_code": int(wc),
-        "is_peak": int(hour in (7, 8, 9, 10, 17, 18, 19, 20, 21)),
-        "is_night": int(hour < 5 or hour >= 23),
-    }
-    return np.array([[row[c] for c in bundle["features"]]]), row
-
-
-def predict_pipeline(at, weather, flow, bundle):
-    """Base -> adapted (transfer) -> live-fused final."""
-    X, row = featurize(at, weather, bundle)
-    base_vol = float(bundle["model"].predict(X)[0])
-    cal_X = np.array([[base_vol, row["rain_1h"], row["hour"], row["is_peak"]]])
-    adapted_vol = float(bundle["calibration"].predict(cal_X)[0])
-    ratio = float(flow.get("congestion_ratio", 0.7))
-    implied_vol = (1.0 - ratio) * 5500  # volume implied by live speed
-    final_vol = 0.65 * adapted_vol + 0.35 * implied_vol
-    th = bundle["thresholds"]
-    return {
-        "base_vol": int(base_vol), "base_level": classify(base_vol, th),
-        "adapted_vol": int(adapted_vol), "adapted_level": classify(adapted_vol, th),
-        "final_vol": int(final_vol), "final_level": classify(final_vol, th),
-        "implied_vol": int(implied_vol), "features": row,
-    }
-
-
-def explain_prediction(pred, weather, flow, bundle) -> list[str]:
+def explain_prediction(pred: dict, weather: dict, flow: dict, bundle: dict) -> list[str]:
     f = pred["features"]
     out = []
     if f["is_peak"]:
@@ -127,9 +94,14 @@ def explain_prediction(pred, weather, flow, bundle) -> list[str]:
         out.append((f"🛣 Live speed ratio {ratio:.2f} — near free-flow, no uplift", -1))
     if f["clouds_all"] > 70:
         out.append((f"☁ Overcast ({f['clouds_all']}%) — small visibility effect", 1))
-    # sort by absolute impact
     out.sort(key=lambda x: -abs(x[1]))
     return [t for t, _ in out]
+
+
+@st.cache_data(ttl=60)
+def cached_fetch_flow(lat: float, lon: float, free_flow: float, key: str | None, hint: float):
+    """Caches route flow fetches to avoid redundant API hammering on reruns."""
+    return fetch_tomtom_flow(lat, lon, free_flow, key, congestion_hint=hint)
 
 
 # ---------------- Sidebar ----------------
@@ -144,17 +116,21 @@ route_name = st.sidebar.selectbox("Route / location", route_names)
 route = next(r for r in routes if r["name"] == route_name)
 
 with st.sidebar.expander("➕ Custom location (optional)"):
-    c_lat = st.number_input("Latitude", value=float(route["lat"]), format="%.5f")
-    c_lon = st.number_input("Longitude", value=float(route["lon"]), format="%.5f")
-    c_ff = st.number_input("Free-flow speed (km/h)", value=int(route["free_flow"]), min_value=20, max_value=120)
+    c_lat = st.number_input("Latitude", value=float(route["lat"]), min_value=-90.0, max_value=90.0, format="%.5f")
+    c_lon = st.number_input("Longitude", value=float(route["lon"]), min_value=-180.0, max_value=180.0, format="%.5f")
+    c_ff = st.number_input("Free-flow speed (km/h)", value=int(route["free_flow"]), min_value=10, max_value=120)
     use_custom = st.checkbox("Use custom location", value=False)
 if use_custom:
-    route = {"name": "Custom point", "lat": c_lat, "lon": c_lon, "free_flow": c_ff, "length_km": 5.0}
+    try:
+        val_lat, val_lon = validate_coordinates(c_lat, c_lon)
+        route = {"name": "Custom point", "lat": val_lat, "lon": val_lon, "free_flow": c_ff, "length_km": 5.0}
+    except ValueError as _e:
+        st.sidebar.error(f"Invalid coordinates: {_e}")
 
 st.sidebar.subheader("⏱ Time")
 use_now = st.checkbox("Use current time", value=True)
 if use_now:
-    at = dt.datetime.now().replace(second=0, microsecond=0)
+    at = get_city_now(city)
 else:
     d = st.sidebar.date_input("Date", value=dt.date.today())
     h = st.sidebar.slider("Hour", 0, 23, 18)
@@ -164,60 +140,63 @@ horizon = st.sidebar.select_slider("Forecast horizon (min)", [0, 15, 30, 60], va
 st.sidebar.subheader("🔑 Live APIs (optional)")
 def _secret(name: str) -> str:
     try:
-        return str(st.secrets.get(name, ""))  # .streamlit/secrets.toml
+        return str(st.secrets.get(name, ""))
     except Exception:
         return os.environ.get(name, "")
-tom_default = _secret("TOMTOM_API_KEY")
-owm_default = _secret("OPENWEATHER_API_KEY")
-tom_key = st.sidebar.text_input("TomTom KEY VALUE", value=tom_default, type="password",
-                                help="Pre-filled from .streamlit/secrets.toml. Paste the KEY VALUE (copy/eye icon), NOT the Key ID.")
-owm_key = st.sidebar.text_input("OpenWeather API key", value=owm_default, type="password",
-                                help="New keys need 30-120 min activation; Open-Meteo live fallback covers you meanwhile.")
-st.sidebar.caption("TomTom live ✅ · Weather: OpenWeather → Open-Meteo live fallback → simulation. "
-                   "Domain whitelist OFF is correct for localhost.")
+tom_user = st.sidebar.text_input("TomTom KEY VALUE (optional)", value="", type="password",
+                                help="Leave blank to use server environment / secrets.toml key.")
+owm_user = st.sidebar.text_input("OpenWeather API key (optional)", value="", type="password",
+                                help="Leave blank to use server environment / secrets.toml key. (Open-Meteo fallback active if blank)")
+tom_key = tom_user.strip() or _secret("TOMTOM_API_KEY")
+owm_key = owm_user.strip() or _secret("OPENWEATHER_API_KEY")
+st.sidebar.caption("TomTom live ✅ · Weather: OpenWeather → Open-Meteo live fallback → simulation.")
 
-# ---------------- Live data (cached fallback: demo never dies on network) ----------------
-import json as _json
-CACHE_FILE = os.path.join(os.path.dirname(__file__), "last_response.json")
+# ---------------- Live data (isolated weather cache with atomic write) ----------------
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+WEATHER_CACHE_FILE = os.path.join(DATA_DIR, "weather_cache.json")
+
 try:
     weather = fetch_openweather(route["lat"], route["lon"], owm_key or None)
     if "live:" in str(weather.get("source", "")):
         try:
-            with open(CACHE_FILE, "w") as _cf:
-                _cf.write(_json.dumps({"weather": weather,
-                                       "cached_at": dt.datetime.now().isoformat(timespec="seconds")}, default=str))
+            tmp_cf = WEATHER_CACHE_FILE + ".tmp"
+            with open(tmp_cf, "w") as _cf:
+                json.dump({"weather": weather, "cached_at": dt.datetime.now().isoformat(timespec="seconds")}, _cf)
+            os.replace(tmp_cf, WEATHER_CACHE_FILE)
         except Exception:
             pass
 except Exception as _e:
     try:
-        _cached = _json.load(open(CACHE_FILE))
-        weather = _cached.get("weather", _cached.get("live", {}).get("weather", {})) or _cached["live"]
-        st.warning(f"Live weather unavailable ({_e}) — showing last cached data "
-                   f"(cached at {_cached.get('cached_at', '?')}).")
+        _cached = json.load(open(WEATHER_CACHE_FILE))
+        weather = _cached.get("weather", {})
+        st.warning(f"Live weather unavailable ({_e}) — showing cached data (cached at {_cached.get('cached_at', '?')}).")
     except Exception:
         weather = fetch_openweather(route["lat"], route["lon"], None)
-# First pass congestion hint from historical mean for that hour
+
+# Congestion hint from historical mean
 hist = india_df if city != "Minneapolis (Source / US)" else us_df
 hour_mean = hist[hist["date_time"].dt.hour == at.hour]["traffic_volume"].mean()
 hint = float(np.clip(hour_mean / 5500, 0.05, 0.95))
-flow = fetch_tomtom_flow(route["lat"], route["lon"], route["free_flow"], tom_key or None,
-                         congestion_hint=hint)
-# adjust travel time
-length = route.get("length_km", 5.0)
-flow["travel_time_min"] = round(length / max(flow["current_speed"], 1) * 60, 1)
-flow["free_time_min"] = round(length / max(flow["free_flow_speed"], 1) * 60, 1)
-flow["delay_min"] = round(flow["travel_time_min"] - flow["free_time_min"], 1)
+flow = fetch_tomtom_flow(route["lat"], route["lon"], route["free_flow"], tom_key or None, congestion_hint=hint)
 
-pred = predict_pipeline(at, weather, flow, bundle)
+# Safe travel time calculations (division-by-zero safeguarded)
+length = max(float(route.get("length_km", 5.0)), 0.5)
+ff_safe = max(float(flow.get("free_flow_speed") or 30.0), 10.0)
+cur_safe = max(float(flow.get("current_speed") or 10.0), 5.0)
+flow["travel_time_min"] = round(length / cur_safe * 60, 1)
+flow["free_time_min"] = round(length / ff_safe * 60, 1)
+flow["delay_min"] = round(max(flow["travel_time_min"] - flow["free_time_min"], 0.0), 1)
+
+pred = predict_pipeline(at, weather, flow, bundle, minutes_ahead=0)
 reasons = explain_prediction(pred, weather, flow, bundle)
 
-# Future forecasts
+# Future forecasts with exponential horizon decay
 horizons = [15, 30, 60]
 future_rows = []
 for m in horizons:
-    fat = at + dt.timedelta(minutes=m)
-    fp = predict_pipeline(fat, weather, flow, bundle)
-    future_rows.append({"in_min": m, "time": fat.strftime("%H:%M"), **fp})
+    fp = predict_pipeline(at, weather, flow, bundle, minutes_ahead=m)
+    future_rows.append({"in_min": m, "time": fp["target_dt"].strftime("%H:%M"), **fp})
 future_df = pd.DataFrame(future_rows)
 
 severe_now = pred["final_level"] == "Severe"
@@ -230,12 +209,15 @@ st.caption(f"Base model trained on US history ({bundle['metrics']['n_us']:,} row
            f"Thresholds Low<{bundle['thresholds'][0]:.0f} < Moderate<{bundle['thresholds'][1]:.0f} < "
            f"High<{bundle['thresholds'][2]:.0f} < Severe")
 
+safe_city = html.escape(str(city))
+safe_route = html.escape(str(route_name))
+
 if severe_now or severe_soon:
     who = "NOW" if severe_now else f"in ~{future_df[future_df.final_level=='Severe'].iloc[0]['in_min']} min"
-    st.error(f"🚨 CONGESTION ALERT — Severe congestion detected/predicted {who} on **{route_name}, {city}**. "
+    st.error(f"🚨 CONGESTION ALERT — Severe congestion detected/predicted {who} on **{safe_route}, {safe_city}**. "
              f"Consider delaying departure or an alternate route. ({'; '.join(reasons[:2])})")
 else:
-    st.success(f"✅ No severe congestion — {route_name} is **{pred['final_level']}** "
+    st.success(f"✅ No severe congestion — {safe_route} is **{pred['final_level']}** "
                f"({pred['final_vol']:,} veh/hr est.), delay +{flow['delay_min']} min.")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
@@ -249,26 +231,37 @@ with tab1:
               "jammed" if flow["congestion_ratio"] < 0.5 else "flowing")
     c3.metric("Predicted volume", f"{pred['final_vol']:,} veh/hr", pred["final_level"])
     c4.metric("Delay", f"+{flow['delay_min']} min", f"trip {flow['travel_time_min']} min")
+
     if horizon == 0:
         hpred, hlabel = pred["final_vol"], pred["final_level"]
     else:
         hrow = future_df[future_df["in_min"] == horizon].iloc[0]
         hpred, hlabel = int(hrow["final_vol"]), str(hrow["final_level"])
+
+    # XSS-Safe HTML Rendering
+    safe_final_level = html.escape(str(pred['final_level']))
+    safe_hlabel = html.escape(str(hlabel))
+    color_now = LEVEL_COLOR.get(pred['final_level'], '#6b7280')
+    color_h = LEVEL_COLOR.get(hlabel, '#6b7280')
+
     st.markdown(f"### Predicted congestion: "
-                f"<span style='background:{LEVEL_COLOR[pred['final_level']]};color:white;"
-                f"padding:4px 14px;border-radius:12px'>{pred['final_level']}</span>"
-                f" &nbsp;·&nbsp; T+{horizon}min: "
-                f"<span style='background:{LEVEL_COLOR[hlabel]};color:white;"
-                f"padding:4px 14px;border-radius:12px'>{hlabel} ({hpred:,} veh/hr)</span>",
+                f"<span style='background:{color_now};color:white;"
+                f"padding:4px 14px;border-radius:12px'>{safe_final_level}</span>"
+                f" &nbsp;·&nbsp; T+{int(horizon)}min: "
+                f"<span style='background:{color_h};color:white;"
+                f"padding:4px 14px;border-radius:12px'>{safe_hlabel} ({hpred:,} veh/hr)</span>",
                 unsafe_allow_html=True)
-    st.write(f"**{at.strftime('%A, %d %b %Y %H:%M')}** · {route_name}, {city} · "
+
+    st.write(f"**{at.strftime('%A, %d %b %Y %H:%M')}** · {safe_route}, {safe_city} · "
              f"Weather **{weather['weather_main']}**, {weather['temp']-273.15:.1f}°C, "
              f"rain {weather['rain_1h']} mm/h, clouds {weather['clouds_all']}%")
     st.caption(f"Data sources → traffic: `{flow['source']}` · weather: `{weather['source']}`")
     st.info("🧩 **How real-time data contributes:** " + contribution_text(pred["adapted_vol"],
                                                                           flow["congestion_ratio"], weather))
+
     # ---------------- Interpretability / SHAP Section ----------------
-    shap_exp = compute_shap_explanation(at, weather, flow, bundle, horizon_min=horizon)
+    shap_exp = compute_shap_explanation(at, weather, flow, bundle, horizon_min=horizon,
+                                        pipeline_pred=pred if horizon == 0 else None)
     target_time_str = (at + dt.timedelta(minutes=horizon)).strftime('%H:%M')
 
     if horizon == 0:
@@ -276,11 +269,9 @@ with tab1:
     else:
         st.subheader(f"🔍 Why {hlabel} Congestion in {horizon} mins ({target_time_str})? (SHAP Explainability)")
 
-    # Prominent callout with exact percentage contribution
     st.info(f"💡 **Key Prediction Drivers:** {shap_exp['headline_sentence']}.\n\n"
             f"*{shap_exp['summary_text']}*")
 
-    # Display Top 3 Driver Metric Cards
     if shap_exp.get("top_drivers"):
         m_cols = st.columns(min(3, len(shap_exp["top_drivers"])))
         for i, driver in enumerate(shap_exp["top_drivers"][:3]):
@@ -294,7 +285,6 @@ with tab1:
                     delta_color="inverse" if driver["impact"] > 0 else "normal",
                 )
 
-    # Multi-tab visual interpretability
     iv_tab1, iv_tab2, iv_tab3, iv_tab4 = st.tabs([
         "📊 Factor Contribution (%)",
         "🌊 Volume Build-Up Waterfall",
@@ -303,15 +293,15 @@ with tab1:
     ])
 
     with iv_tab1:
-        st.plotly_chart(plot_shap_factor_bars(shap_exp), use_container_width=True)
+        st.plotly_chart(plot_shap_factor_bars(shap_exp), use_container_width=True, key="iv_factor_bars")
         st.caption("🔴 Positive impact increases congestion volume · 🟢 Negative impact eases traffic flow.")
 
     with iv_tab2:
-        st.plotly_chart(plot_shap_waterfall_chart(shap_exp), use_container_width=True)
+        st.plotly_chart(plot_shap_waterfall_chart(shap_exp), use_container_width=True, key="iv_waterfall")
         st.caption(f"Traces the prediction from historical base average ({shap_exp['base_expected_value']:,.0f} veh/hr) to final forecasted volume.")
 
     with iv_tab3:
-        st.plotly_chart(plot_shap_driver_shares(shap_exp), use_container_width=True)
+        st.plotly_chart(plot_shap_driver_shares(shap_exp), use_container_width=True, key="iv_driver_shares")
         st.caption("Proportional share of factors driving traffic above baseline.")
 
     with iv_tab4:
@@ -347,8 +337,6 @@ with tab2:
         })
         fig2 = px.line(plot_df, x="horizon", y=["final", "adapted", "base"],
                        markers=True, title="How congestion is expected to change")
-        for lvl, col in LEVEL_COLOR.items():
-            pass
         st.plotly_chart(fig2, use_container_width=True)
     except Exception as e:
         st.line_chart(future_df.set_index("in_min")[["final_vol"]])
@@ -367,30 +355,29 @@ with tab2:
     st.info(h_shap["summary_text"])
     fc_col1, fc_col2 = st.columns([3, 2])
     with fc_col1:
-        st.plotly_chart(plot_shap_factor_bars(h_shap), use_container_width=True)
+        st.plotly_chart(plot_shap_factor_bars(h_shap), use_container_width=True, key="fc_factor_bars")
     with fc_col2:
-        st.plotly_chart(plot_shap_driver_shares(h_shap), use_container_width=True)
+        st.plotly_chart(plot_shap_driver_shares(h_shap), use_container_width=True, key="fc_driver_shares")
 
 # ---------------- TAB 3 ----------------
 with tab3:
-    st.subheader(f"Congestion heatmap — {city}")
+    st.subheader(f"Congestion heatmap — {safe_city}")
     rows = []
     for r in routes:
-        w = weather  # same city weather for demo speed; per-route live speed simulated
-        fl = fetch_tomtom_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, congestion_hint=hint)
+        w = weather
+        fl = cached_fetch_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, hint)
         p = predict_pipeline(at, w, fl, bundle)
         rows.append({"route": r["name"], "lat": r["lat"], "lon": r["lon"],
                      "level": p["final_level"], "vol": p["final_vol"],
                      "speed": fl["current_speed"], "color": LEVEL_COLOR[p["final_level"]]})
     hmap = pd.DataFrame(rows)
     st.dataframe(hmap[["route", "level", "vol", "speed"]], use_container_width=True)
-    # Map: plotly scatter_map (no token, open-street-map) + st.map fallback
     try:
         import plotly.express as px
         figm = px.scatter_map(hmap, lat="lat", lon="lon", color="level",
                               color_discrete_map=LEVEL_COLOR, size="vol",
                               hover_name="route", hover_data={"vol": True, "speed": True, "lat": False, "lon": False},
-                              zoom=11, height=520, title=f"Current & predicted congestion — {city}")
+                              zoom=11, height=520, title=f"Current & predicted congestion — {safe_city}")
         figm.update_layout(map_style="open-street-map", margin=dict(l=0, r=0, t=40, b=0))
         st.plotly_chart(figm, use_container_width=True)
     except Exception as e:
@@ -434,18 +421,18 @@ with tab4:
         st.metric("Weekday avg", f"{g_dow.loc[0:4].mean():,.0f} veh/hr")
         st.metric("Weekend avg", f"{g_dow.loc[5:6].mean():,.0f} veh/hr")
     st.info("📌 **Pattern-based insight:** the model exploits the double rush-hour peaks, "
-            "the weekday/weekend gap, holiday drops and rain penalties visible above. "
-            "Indian calibration shifts peaks ~1h later and raises the overall scale.")
+            "the weekday/weekend gap, holiday drops and rain penalties visible above.")
 
 # ---------------- TAB 5 ----------------
 with tab5:
     st.subheader("Cross-context adaptation: US base → Indian city (transfer learning)")
     m = bundle["metrics"]
-    st.write(f"**Base model** (XGBoost, trained on US history): "
+    st.write(f"**Base model** (XGBoost, chronological out-of-time test): "
              f"MAE **{m['base_mae']:.1f}**, RMSE **{m['base_rmse']:.1f}**.")
-    st.write(f"**Without adaptation** on India sample: MAE **{m['calib_mae_unadapted']:.1f}** → "
+    st.write(f"**Without adaptation** on Indian corridor validation set: MAE **{m['calib_mae_unadapted']:.1f}** → "
              f"**with Ridge calibration: {m['calib_mae_adapted']:.1f}** "
-             f"({(1-m['calib_mae_adapted']/max(m['calib_mae_unadapted'],1))*100:.1f}% error drop).")
+             f"({(1-m['calib_mae_adapted']/max(m['calib_mae_unadapted'],1))*100:.1f}% held-out error drop).")
+    st.caption(f"Evaluated on held-out 30% chronological validation split ({m.get('n_india_val', 101)} rows) — zero in-sample contamination.")
     comp = pd.DataFrame({
         "stage": ["Base (US)", "Adapted (India-calibrated)", "Final (adapted + live fusion)"],
         "volume": [pred["base_vol"], pred["adapted_vol"], pred["final_vol"]],
@@ -454,13 +441,7 @@ with tab5:
     st.dataframe(comp, use_container_width=True)
     delta = pred["adapted_vol"] - pred["base_vol"]
     st.info(f"🔧 Calibration adjusted the US prediction by **{delta:+,} veh/hr** "
-            f"({pred['base_level']} → {pred['adapted_level']}) using live-calibrated Ridge stacking on "
-            f"[base_pred, rain, hour, is_peak]. Live-speed fusion then moved it to "
-            f"**{pred['final_vol']:,} ({pred['final_level']})**.")
-    st.caption("Technique: two-stage fine-tuning / stacking — universal temporal patterns stay frozen in "
-               "the base model; a tiny Ridge head corrects scale & monsoon/peak-shift bias for the new city. "
-               "Needs only ~2 weeks of API polling to fit.")
-    # Priority 3 — live collector proof (Hour 0 Track C): indian_realtime.csv
+            f"({pred['base_level']} → {pred['adapted_level']}) using transfer Ridge stacking.")
     st.subheader("🇮🇳 Indian context calibration (live collector)")
     _csv = None
     for _p in (os.path.join(os.path.dirname(__file__), "data", "indian_realtime.csv"),
@@ -472,17 +453,24 @@ with tab5:
     if _csv:
         try:
             ind = pd.read_csv(_csv)
-            st.write(f"Collected **{len(ind)}** real-time samples across "
-                     f"**{ind['location'].nunique()}** locations (`{_csv}`).")
-            st.line_chart(ind, x="timestamp", y="congestion_ratio", color="location")
-            st.caption("Online calibration against live TomTom data: the Ridge head + live-speed fusion "
-                       "(see adjustment above) is the adaptation mechanism — this growing CSV is its evidence, "
-                       "even with limited rows.")
+            if "traffic_source" in ind.columns:
+                real_ind = ind[ind["traffic_source"].str.startswith("live:", na=False)]
+                sim_count = len(ind) - len(real_ind)
+            else:
+                real_ind = ind
+                sim_count = 0
+            st.write(f"Logged **{len(real_ind)}** genuine live sensor observations "
+                     f"(omitted {sim_count} simulated fallback rows) across "
+                     f"**{real_ind['location'].nunique() if len(real_ind)>0 else 0}** locations (`{_csv}`).")
+            if len(real_ind) > 0:
+                st.line_chart(real_ind, x="timestamp", y="congestion_ratio", color="location")
+            else:
+                st.info("Collector CSV contains simulated/initialization rows. Run collector.py with a live TomTom key to chart live sensor data.")
         except Exception as e:
-            st.warning(f"Could not read collector CSV ({e}). Run `python collector.py` in terminal 2.")
+            st.warning(f"Could not read collector CSV ({e}).")
     else:
-        st.warning("No collector data yet — run `python collector.py` in a second terminal "
-                   "(15-min cadence → ~20 rows/location by hour 5).")
+        st.warning("No collector data yet — run `python collector.py` in a second terminal.")
+    st.caption("Transfer learning Ridge calibration is trained on an Indian corridor pattern sample with held-out chronological validation. collector.py logs real-time TomTom sensor data for production ground-truth validation.")
 
 # ---------------- TAB 6 ----------------
 with tab6:
@@ -492,31 +480,37 @@ with tab6:
         a_name = st.selectbox("Route A", route_names, index=0, key="ra")
     with col_b:
         b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key="rb")
-    ra = next(r for r in routes if r["name"] == a_name)
-    rb = next(r for r in routes if r["name"] == b_name)
-    results = []
-    for r in (ra, rb):
-        fl = fetch_tomtom_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, congestion_hint=hint)
-        p = predict_pipeline(at, weather, fl, bundle)
-        length_r = r.get("length_km", 5.0)
-        tmin = round(length_r / max(fl["current_speed"], 1) * 60, 1)
-        results.append({"route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
-                        "speed": fl["current_speed"], "trip_min": tmin, "delay": round(tmin - length_r / max(fl["free_flow_speed"], 1) * 60, 1)})
-    res_df = pd.DataFrame(results)
-    st.dataframe(res_df, use_container_width=True)
-    best = res_df.loc[res_df["trip_min"].idxmin()]
-    st.success(f"✅ Recommendation: **{best['route']}** — {best['trip_min']} min, "
-               f"{best['level']} congestion at {best['speed']} km/h. "
-               f"Alternative is {res_df['trip_min'].max():.1f} min.")
-    try:
-        import plotly.express as px
-        st.plotly_chart(px.bar(res_df, x="route", y="trip_min", color="level",
-                               color_discrete_map=LEVEL_COLOR, title="Trip-time comparison"),
-                        use_container_width=True)
-    except Exception:
-        st.bar_chart(res_df.set_index("route")["trip_min"])
+
+    if a_name == b_name:
+        st.warning("⚠️ Please select two different routes to compare corridors.")
+    else:
+        ra = next(r for r in routes if r["name"] == a_name)
+        rb = next(r for r in routes if r["name"] == b_name)
+        results = []
+        for r in (ra, rb):
+            fl = cached_fetch_flow(r["lat"], r["lon"], r["free_flow"], tom_key or None, hint)
+            p = predict_pipeline(at, weather, fl, bundle)
+            len_km = max(float(r.get("length_km", 5.0)), 0.5)
+            cur_spd = max(float(fl.get("current_speed") or 10.0), 5.0)
+            ff_spd = max(float(fl.get("free_flow_speed") or 30.0), 10.0)
+            tmin = round(len_km / cur_spd * 60, 1)
+            free_min = round(len_km / ff_spd * 60, 1)
+            results.append({
+                "route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
+                "speed": fl["current_speed"], "trip_min": tmin, "delay": round(max(tmin - free_min, 0.0), 1)
+            })
+        res_df = pd.DataFrame(results)
+        st.dataframe(res_df, use_container_width=True)
+        best = res_df.loc[res_df["trip_min"].idxmin()]
+        st.success(f"✅ Recommendation: **{html.escape(str(best['route']))}** — {best['trip_min']} min, "
+                   f"{best['level']} congestion at {best['speed']} km/h.")
+        try:
+            import plotly.express as px
+            st.plotly_chart(px.bar(res_df, x="route", y="trip_min", color="level",
+                                   color_discrete_map=LEVEL_COLOR, title="Trip-time comparison"),
+                            use_container_width=True)
+        except Exception:
+            st.bar_chart(res_df.set_index("route")["trip_min"])
 
 st.divider()
-st.caption("Prototype: XGBoost-class gradient boosting + Ridge calibration · "
-           "TomTom Traffic Flow + OpenWeather One Call 3.0 (simulated fallback) · "
-           "UCI Metro Interstate schema · Built for TE/BE Smart City PS.")
+st.caption("Hardened prototype: XGBoost + Ridge calibration · TomTom + OpenWeather / Open-Meteo · Canonical schema.")
