@@ -19,7 +19,9 @@ CSV_CANDIDATES = [
     "data/Metro_Interstate_Traffic_Volume.csv",
     "data/Metro_Interstate_Traffic_Data.csv",
 ]
-CSV = next((c for c in CSV_CANDIDATES if os.path.exists(c)), CSV_CANDIDATES[0])
+# INDIA-first override: TRAIN_CSV=data/synthetic_india_v2.csv trains the base
+# on India-pattern data (peak-shifted, monsoon, denser mixed traffic).
+CSV = os.environ.get("TRAIN_CSV") or next((c for c in CSV_CANDIDATES if os.path.exists(c)), CSV_CANDIDATES[0])
 
 try:
     from xgboost import XGBRegressor

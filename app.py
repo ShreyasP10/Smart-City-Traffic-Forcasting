@@ -117,7 +117,7 @@ us_df, india_df = load_data()
 st.sidebar.title("🚦 Controls")
 city = st.sidebar.selectbox("City (context)", list(CITIES.keys()), index=0)
 routes = CITIES[city]["routes"]
-route_name = st.sidebar.selectbox("Route / location", route_names, key=f"route_{city}")
+route_name = st.sidebar.selectbox("Route / location", [r["name"] for r in routes], key=f"route_{city}")
 route = next((r for r in routes if r["name"] == route_name), routes[0] if routes else None)
 if route is None:
     route = {"name": route_name or "Default route", "lat": 19.076, "lon": 72.877, "free_flow": 50, "length_km": 5.0}
@@ -241,7 +241,7 @@ shap_exp = compute_shap_explanation(
 
 # ---------------- Header ----------------
 st.title("🚦 Smart City Real-Time Traffic Congestion Forecasting & Adaptation")
-st.caption(f"Base model trained on US history ({bundle['metrics']['n_us']:,} rows) → "
+st.caption(f"Base model trained on historical patterns ({bundle['metrics']['n_us']:,} rows) → " 
            f"calibrated on small India sample ({bundle['metrics']['n_india_calib']} rows) · "
            f"Thresholds Low<{bundle['thresholds'][0]:.0f} < Moderate<{bundle['thresholds'][1]:.0f} < "
            f"High<{bundle['thresholds'][2]:.0f} < Severe")
@@ -482,7 +482,7 @@ with tab4:
 
 # ---------------- TAB 5 ----------------
 with tab5:
-    st.subheader("Cross-context adaptation: US base → Indian city (transfer learning)")
+    st.subheader("Cross-context adaptation: historical base → live corridors (transfer learning)")
     m = bundle["metrics"]
     st.write(f"**Base model** (XGBoost, chronological out-of-time test): "
              f"MAE **{m['base_mae']:.1f}**, RMSE **{m['base_rmse']:.1f}**.")
@@ -491,7 +491,7 @@ with tab5:
              f"({(1-m['calib_mae_adapted']/max(m['calib_mae_unadapted'],1))*100:.1f}% held-out error drop).")
     st.caption(f"Evaluated on held-out 30% chronological validation split ({m.get('n_india_val', 101)} rows) — zero in-sample contamination.")
     comp = pd.DataFrame({
-        "stage": ["Base (US)", "Adapted (India-calibrated)", "Final (adapted + live fusion)"],
+        "stage": ["Base", "Adapted (live corridors)", "Final (adapted + live fusion)"],
         "volume": [pred["base_vol"], pred["adapted_vol"], pred["final_vol"]],
         "level": [pred["base_level"], pred["adapted_level"], pred["final_level"]],
     })
@@ -534,9 +534,10 @@ with tab6:
     st.subheader("Route comparison — pick the faster corridor")
     col_a, col_b = st.columns(2)
     with col_a:
-        a_name = st.selectbox("Route A", route_names, index=0, key=f"ra_{city}")
+        a_name = st.selectbox("Route A", [r["name"] for r in routes], index=0, key=f"ra_{city}")
     with col_b:
-        b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key=f"rb_{city}")
+        b_names = [r["name"] for r in routes]
+        b_name = st.selectbox("Route B", b_names, index=min(1, len(b_names) - 1), key=f"rb_{city}")
 
     if a_name == b_name:
         st.warning("⚠️ Please select two different routes to compare corridors.")

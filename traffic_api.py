@@ -343,7 +343,13 @@ def fetch_tomtom_routes(origin: tuple[float, float], dest: tuple[float, float],
 
 def fetch_tomtom_incidents(lat: float, lon: float, api_key: str | None,
                            radius_deg: float = 0.05) -> dict:
-    """Nearby incidents for alerts banner with bounded bbox coordinates."""
+    """Nearby incidents with category, delay, description + distance, nearest first."""
+    INCIDENT_NAMES = {
+        0: "Traffic incident", 1: "Accident", 2: "Fog", 3: "Dangerous conditions",
+        4: "Rain hazard", 5: "Ice", 6: "Traffic jam", 7: "Lane closed",
+        8: "Road closed", 9: "Road works", 10: "High wind", 11: "Flooding",
+        12: "Detour", 13: "Incident cluster", 14: "Broken-down vehicle",
+    }
     try:
         lat_f, lon_f = validate_coordinates(lat, lon)
     except ValueError as e:
@@ -352,17 +358,43 @@ def fetch_tomtom_incidents(lat: float, lon: float, api_key: str | None,
     api_key = (api_key or "").strip()
     if api_key and len(api_key) >= 20:
         try:
+            import math
             bbox = f"{lon_f - radius_deg},{lat_f - radius_deg},{lon_f + radius_deg},{lat_f + radius_deg}"
             url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
             params = {
                 "bbox": bbox,
-                "fields": "{incidents{type,properties{iconCategory,delay}}}",
+                "fields": "{incidents{type,geometry{coordinates},properties{iconCategory,delay,description}}}",
                 "key": api_key,
             }
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             inc = r.json().get("incidents", [])
-            return {"ok": True, "count": len(inc), "incidents": inc[:5], "source": "live:tomtom-incidents"}
+            parsed = []
+            for g in inc:
+                try:
+                    props = g.get("properties", {}) or {}
+                    coords = (g.get("geometry", {}) or {}).get("coordinates", [])
+                    # TomTom geometry: list of [lon, lat] line points; use first point
+                    pt = coords[0] if coords else [lon_f, lat_f]
+                    ilon = float(pt[0]) if isinstance(pt, (list, tuple)) else lon_f
+                    ilat = float(pt[1]) if isinstance(pt, (list, tuple)) and len(pt) > 1 else lat_f
+                    p1, p2 = math.radians(lat_f), math.radians(ilat)
+                    hh = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+                          * math.sin(math.radians(ilon - lon_f) / 2) ** 2)
+                    dist = 2 * 6371.0 * math.asin(math.sqrt(hh))
+                    parsed.append({
+                        "category": int(props.get("iconCategory", 0)),
+                        "category_name": INCIDENT_NAMES.get(int(props.get("iconCategory", 0)), "Traffic incident"),
+                        "delay_s": int(props.get("delay", 0) or 0),
+                        "description": str(props.get("description") or ""),
+                        "lat": round(ilat, 5), "lon": round(ilon, 5),
+                        "distance_km": round(dist, 2),
+                    })
+                except Exception:
+                    continue
+            parsed.sort(key=lambda x: x["distance_km"])
+            return {"ok": True, "count": len(parsed), "incidents": parsed[:5],
+                    "source": "live:tomtom-incidents"}
         except Exception as e:
             return {"ok": False, "count": 0, "incidents": [], "source": f"simulated (incidents-error: {_redact(e, api_key)})"}
 

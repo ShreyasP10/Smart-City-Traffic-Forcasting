@@ -6,7 +6,7 @@ historical data** (time, day, weather, holidays), **fuses live TomTom + weather 
 serves everything through an **interpretable 6-tab Streamlit dashboard** with
 Low / Moderate / High / Severe congestion levels.
 
-Last updated: 2026-10-11 ~13:20 — TrafficSense port complete (10 React views, 14 endpoints).
+Last updated: 2026-10-11 ~16:00 — India-first base live (MAE 119.5, thresholds [177,567,1731]).
 
 ---
 
@@ -15,10 +15,10 @@ Last updated: 2026-10-11 ~13:20 — TrafficSense port complete (10 React views, 
 Terminal 1 — train + verify + dashboard:
 ```powershell
 pip install -r requirements.txt
-python train_base.py        # real UCI (48,204 rows) -> base_model.pkl | XGB MAE 264.6 vs Baseline 277.2
-python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | held-out MAE 487.7
-python sanity_check.py      # expect: Predicted: 5452.45 -> Severe [OK]
-python test_suite.py        # 6/6 unit tests pass (waterfall additivity, decay, boundaries, holidays, SSRF, SHA-256)
+python train_base.py        # India-pattern base (17,520 rows) -> base_model.pkl | XGB MAE 119.5 (15% over baseline)
+python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | held-out 100.6 -> 105.7
+python sanity_check.py      # expect: Predicted: 2540.79 -> Severe [OK]
+python test_suite.py        # 7/7 unit tests pass (waterfall additivity, decay, boundaries, holidays, SSRF, SHA-256, route fallback)
 python predict.py           # expect: 4 live lines T+0/15/30/60 with dynamic SHAP attribution
 python test_tomtom.py <KEY> # optional key check: flow + routing + incidents, all live
 streamlit run app.py        # dashboard http://localhost:8501
@@ -63,8 +63,9 @@ npm run build          # production build check (verified ✅)
 | `GET /api/geocode?q=` | Nominatim proxy → any global city → custom-point forecast |
 | `POST /api/keys` `{tomtom, openweather}` | Runtime keys (memory only) → flips sim → live |
 | `GET /api/tiles` | TomTom raster tile URL template (when key set) |
-| `GET /api/corridor?…&alts=2` | 🛣 Path options (TomTom maxAlternatives live, else Fastest/Shortest synth) + midpoint prediction + advice |
+| `GET /api/corridor?…&alts=2` | 🛣 Path options with road geometry (TomTom legs / free OSRM) + midpoint prediction + advice |
 | `GET /api/grid?city=&horizon=` | 9-point telemetry grid for map overlay |
+| `GET /api/routes?city=&horizon=` | Every corridor as road geometry + per-route stats table |
 | `GET /api/model` | Active model backend/metrics/custom flag |
 | `POST /api/retrain` (CSV + trees/depth/lr) | 🧠 In-app retrain → swaps live bundle |
 
@@ -103,13 +104,13 @@ All 8 verified live (simulated-mode: forecast Low×4 Sat-midday; heatmap 5 pts; 
 
 | # | PS requirement | Implementation | Evidence |
 |---|---|---|---|
-| 1 | Pattern learning (time/day/weather/holidays/volume) | `train_base.py` + canonical `schema.py` features on real UCI | MAE 286.3 (~9% of mean 3259); Patterns tab curves |
+| 1 | Pattern learning (time/day/weather/holidays/volume) | `train_base.py` + canonical `schema.py` features on India-pattern data (17,520 rows) | MAE 119.5 (~11% of mean ~1100); Patterns tab curves |
 | 2 | Forecast current + near-future (15/30/60) | `predict.py:predict_now(lat,lon,offset)` + Forecast tab table + line | 4 live lines on every run |
 | 3 | Real-time traffic API in the pipeline | `traffic_api.fetch_tomtom_flow()` (flowSegmentData) + Routing for trip times; fusion `0.65*adapted + 0.35*live-implied` | `live:*` badges; contribution note in Overview |
-| 4 | Context adaptation to Indian city | Ridge stacking head `[base_pred, rain, hour, is_peak]` → India scale (235 train / 101 val); Adaptation tab base-vs-adapted + 🇮🇳 live-CSV section | 2240 → 604 MAE (73% drop) |
+| 4 | Context adaptation to Indian city | India-native base + Ridge head `[base_pred, rain, hour, is_peak]` → live corridors (235 train / 101 val); Adaptation tab base-vs-adapted + 🇮🇳 live-CSV section | held-out 100.6 → 105.7 (base already India-scale; head holds parity) |
 | 5 | Interpretability | `explain_shap.py`: SHAP TreeExplainer, % contributions (e.g. "Heavy rain 40%, Rush hour 35%"), Plotly Waterfall + Factor Influence + Donut charts in Overview & Forecast | Overview + Forecast "Why this prediction?" |
 | 6 | Interactive dashboard | `app.py`: 6 tabs, city/route/custom-point + time + horizon controls | serves :8501/:8502 verified |
-| 7 | Classification Low/Moderate/High/Severe | Data-driven quartiles [1186, 3378, 4939] from training volumes | badges + map colors everywhere |
+| 7 | Classification Low/Moderate/High/Severe | Data-driven quartiles [177, 567, 1731] from India-scale training volumes | badges + map colors everywhere |
 | Brownie | Traffic heatmap | Heatmap tab: `px.scatter_map` (OSM, no token), size ∝ volume | green→red corridors |
 | Brownie | Short-term forecasting visualised | Forecast tab line (final/adapted/base) + horizon slider + T+horizon badge | varies at hour boundaries |
 | Brownie | Cross-context prediction | Adaptation tab side-by-side base/adapted/final + delta | e.g. +delta veh/hr shown live |
@@ -151,7 +152,7 @@ Calibration head (4): `base_pred`, `rain_1h`, `hour`, `is_peak`.
 - **Pure SHAP & 100% Additive Waterfall:** Pure Shapley values explain model features with zero invented constants. Downstream intra-hour progression, calibration delta, live speed fusion, and physical bounding / display rounding are displayed as explicit waterfall stages, summing with 100% exact mathematical equality to `final_vol`.
 - **Dynamic Horizons:** Sub-hour linear interpolation and exponential decay (`w_live = 0.35 * exp(-m/45)`) transition smoothly from live sensor dominance at T+0 to temporal model predictions at T+60.
 - **Security & Integrity:** SHA-256 model checksum verification (`safe_load_model()`), input coordinate validation (`validate_coordinates()`), secret token exception scrubbers (`_redact()`), and empty password widget defaults.
-- **Automated Unit Test Suite:** `test_suite.py` validates waterfall additivity, horizon decay monotonicity, classification boundaries, city-specific holidays, SSRF defenses, and SHA-256 integrity (6/6 tests passing).
+- **Automated Unit Test Suite:** `test_suite.py` validates waterfall additivity, horizon decay monotonicity, classification boundaries, city-specific holidays, SSRF defenses, SHA-256 integrity, and city-switch route fallback (7/7 tests passing).
 
 ## 6. Files (what each does)
 

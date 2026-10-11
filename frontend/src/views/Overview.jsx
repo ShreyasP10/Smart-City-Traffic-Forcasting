@@ -46,6 +46,18 @@ export default function Overview({ data, forecast, city, route, rain, holiday, g
       <p className="verdict">📣 City transit verdict: <b>{verdict}</b></p>
       <p className="muted">Sources: {flow.source} / {weather.source}</p>
       <FusionCard flow={flow} pred={pred} />
+      {data.causes?.causes?.length > 0 && (
+        <div className="card">
+          <h4>🧐 Why is there traffic here? (ranked causes)</h4>
+          {data.causes.causes.map((c, i) => (
+            <div key={i} className="row" style={{ alignItems: 'flex-start' }}>
+              <span>{c.kind === 'incident' ? '🚧' : c.kind === 'weather' ? '🌧' : c.kind === 'demand' ? '👥' : c.kind === 'bottleneck' ? '🚗' : '✅'}</span>
+              <span><b>{i + 1}. {c.title}</b><br /><span className="muted">{c.detail}</span></span>
+            </div>
+          ))}
+          <p className="muted">Incidents: {data.causes.incidents_source || 'key needed'} · demand & weather from live model inputs.</p>
+        </div>
+      )}
       <div className="cards">
         <div className="card"><h4>Legacy (history only)</h4><div className="bignum">{pred.base_vol}<span className="unit">veh/hr</span></div><span className="sub">static US baseline · {pred.base_level}</span></div>
         <div className="card"><h4>Upgraded (live fused)</h4><div className="bignum">{pred.final_vol}<span className="unit">veh/hr</span></div><span className="sub">{pred.base_vol ? `${pred.final_vol >= pred.base_vol ? '+' : ''}${Math.round((pred.final_vol - pred.base_vol) / pred.base_vol * 100)}% real-world correction` : ''} · {lvl}</span></div>

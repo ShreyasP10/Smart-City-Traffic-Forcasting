@@ -10,6 +10,8 @@ export const api = {
   overview: (city, route, opts = {}) => get('/api/overview', { city, route, ...opts }),
   forecast: (city, route, opts = {}) => get('/api/forecast', { city, route, ...opts }),
   heatmap: (city) => get('/api/heatmap', { city }),
+  grid: (city, horizon) => get('/api/grid', { city, horizon }),
+  routes: (city, horizon) => get('/api/routes', { city, horizon }),
   patterns: () => get('/api/patterns'),
   adaptation: (city, route, opts = {}) => get('/api/adaptation', { city, route, ...opts }),
   compare: (city, a, b) => get('/api/compare', { city, a, b }),

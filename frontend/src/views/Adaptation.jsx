@@ -6,8 +6,8 @@ export default function Adaptation({ data }) {
   const drop = m.calib_mae_unadapted ? ((1 - (m.calib_mae_adapted || 0) / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
   return (
     <div>
-      <h3>🔁 Cross-context adaptation: US base → Indian city</h3>
-      <p>Base (XGBoost, US history): MAE <b>{m.base_mae?.toFixed(1)}</b>, RMSE <b>{m.base_rmse?.toFixed(1)}</b></p>
+      <h3>🔁 Adaptation: {(data.base_source || 'us-uci').startsWith('india') ? 'India base → live corridors' : 'US base → Indian city'}</h3>
+      <p>Base (XGBoost, {(data.base_source || 'us-uci').startsWith('india') ? 'India patterns' : 'US history'}): MAE <b>{m.base_mae?.toFixed(1)}</b>, RMSE <b>{m.base_rmse?.toFixed(1)}</b></p>
       <p>Without adaptation: <b>{m.calib_mae_unadapted?.toFixed(1)}</b> → with Ridge calibration: <b>{m.calib_mae_adapted?.toFixed(1)}</b> ({drop}% drop)</p>
       <table className="tbl">
         <thead><tr><th>Stage</th><th>Volume</th><th>Level</th></tr></thead>

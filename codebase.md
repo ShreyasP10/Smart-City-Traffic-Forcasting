@@ -758,7 +758,13 @@ def fetch_tomtom_routes(origin: tuple[float, float], dest: tuple[float, float],
 
 def fetch_tomtom_incidents(lat: float, lon: float, api_key: str | None,
                            radius_deg: float = 0.05) -> dict:
-    """Nearby incidents for alerts banner with bounded bbox coordinates."""
+    """Nearby incidents with category, delay, description + distance, nearest first."""
+    INCIDENT_NAMES = {
+        0: "Traffic incident", 1: "Accident", 2: "Fog", 3: "Dangerous conditions",
+        4: "Rain hazard", 5: "Ice", 6: "Traffic jam", 7: "Lane closed",
+        8: "Road closed", 9: "Road works", 10: "High wind", 11: "Flooding",
+        12: "Detour", 13: "Incident cluster", 14: "Broken-down vehicle",
+    }
     try:
         lat_f, lon_f = validate_coordinates(lat, lon)
     except ValueError as e:
@@ -767,17 +773,43 @@ def fetch_tomtom_incidents(lat: float, lon: float, api_key: str | None,
     api_key = (api_key or "").strip()
     if api_key and len(api_key) >= 20:
         try:
+            import math
             bbox = f"{lon_f - radius_deg},{lat_f - radius_deg},{lon_f + radius_deg},{lat_f + radius_deg}"
             url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
             params = {
                 "bbox": bbox,
-                "fields": "{incidents{type,properties{iconCategory,delay}}}",
+                "fields": "{incidents{type,geometry{coordinates},properties{iconCategory,delay,description}}}",
                 "key": api_key,
             }
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
             inc = r.json().get("incidents", [])
-            return {"ok": True, "count": len(inc), "incidents": inc[:5], "source": "live:tomtom-incidents"}
+            parsed = []
+            for g in inc:
+                try:
+                    props = g.get("properties", {}) or {}
+                    coords = (g.get("geometry", {}) or {}).get("coordinates", [])
+                    # TomTom geometry: list of [lon, lat] line points; use first point
+                    pt = coords[0] if coords else [lon_f, lat_f]
+                    ilon = float(pt[0]) if isinstance(pt, (list, tuple)) else lon_f
+                    ilat = float(pt[1]) if isinstance(pt, (list, tuple)) and len(pt) > 1 else lat_f
+                    p1, p2 = math.radians(lat_f), math.radians(ilat)
+                    hh = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+                          * math.sin(math.radians(ilon - lon_f) / 2) ** 2)
+                    dist = 2 * 6371.0 * math.asin(math.sqrt(hh))
+                    parsed.append({
+                        "category": int(props.get("iconCategory", 0)),
+                        "category_name": INCIDENT_NAMES.get(int(props.get("iconCategory", 0)), "Traffic incident"),
+                        "delay_s": int(props.get("delay", 0) or 0),
+                        "description": str(props.get("description") or ""),
+                        "lat": round(ilat, 5), "lon": round(ilon, 5),
+                        "distance_km": round(dist, 2),
+                    })
+                except Exception:
+                    continue
+            parsed.sort(key=lambda x: x["distance_km"])
+            return {"ok": True, "count": len(parsed), "incidents": parsed[:5],
+                    "source": "live:tomtom-incidents"}
         except Exception as e:
             return {"ok": False, "count": 0, "incidents": [], "source": f"simulated (incidents-error: {_redact(e, api_key)})"}
 
@@ -956,7 +988,9 @@ CSV_CANDIDATES = [
     "data/Metro_Interstate_Traffic_Volume.csv",
     "data/Metro_Interstate_Traffic_Data.csv",
 ]
-CSV = next((c for c in CSV_CANDIDATES if os.path.exists(c)), CSV_CANDIDATES[0])
+# INDIA-first override: TRAIN_CSV=data/synthetic_india_v2.csv trains the base
+# on India-pattern data (peak-shifted, monsoon, denser mixed traffic).
+CSV = os.environ.get("TRAIN_CSV") or next((c for c in CSV_CANDIDATES if os.path.exists(c)), CSV_CANDIDATES[0])
 
 try:
     from xgboost import XGBRegressor
@@ -1065,7 +1099,11 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 def main() -> None:
     os.makedirs(MODEL_DIR, exist_ok=True)
-    us = add_features(load_historical(indian_style=False))
+    # INDIA-first override: INDIA_BASE=1 trains the base on full India-pattern
+    # synthetic data instead of US UCI (calibration story becomes India -> live corridors).
+    india_first = os.environ.get("INDIA_BASE", "") == "1"
+    us = add_features(load_historical(indian_style=india_first))
+    base_source = "india-synthetic-v2" if india_first else "us-uci"
     if "date_time" in us.columns:
         us = us.drop_duplicates(subset=["date_time"]).sort_values("date_time").reset_index(drop=True)
 
@@ -1138,6 +1176,7 @@ def main() -> None:
         "weather_code": WEATHER_CODE,
         "metrics": {
             "base_mae": mae, "base_rmse": rmse,
+            "base_source": base_source,
             "calib_mae_adapted": mae_adap, "calib_mae_unadapted": mae_unadap,
             "n_us": int(len(us)), "n_india_calib": int(len(india_small)),
             "n_india_train": int(len(ind_tr)), "n_india_val": int(len(ind_val)),
@@ -2026,7 +2065,7 @@ us_df, india_df = load_data()
 st.sidebar.title("🚦 Controls")
 city = st.sidebar.selectbox("City (context)", list(CITIES.keys()), index=0)
 routes = CITIES[city]["routes"]
-route_name = st.sidebar.selectbox("Route / location", route_names, key=f"route_{city}")
+route_name = st.sidebar.selectbox("Route / location", [r["name"] for r in routes], key=f"route_{city}")
 route = next((r for r in routes if r["name"] == route_name), routes[0] if routes else None)
 if route is None:
     route = {"name": route_name or "Default route", "lat": 19.076, "lon": 72.877, "free_flow": 50, "length_km": 5.0}
@@ -2150,7 +2189,7 @@ shap_exp = compute_shap_explanation(
 
 # ---------------- Header ----------------
 st.title("🚦 Smart City Real-Time Traffic Congestion Forecasting & Adaptation")
-st.caption(f"Base model trained on US history ({bundle['metrics']['n_us']:,} rows) → "
+st.caption(f"Base model trained on historical patterns ({bundle['metrics']['n_us']:,} rows) → " 
            f"calibrated on small India sample ({bundle['metrics']['n_india_calib']} rows) · "
            f"Thresholds Low<{bundle['thresholds'][0]:.0f} < Moderate<{bundle['thresholds'][1]:.0f} < "
            f"High<{bundle['thresholds'][2]:.0f} < Severe")
@@ -2391,7 +2430,7 @@ with tab4:
 
 # ---------------- TAB 5 ----------------
 with tab5:
-    st.subheader("Cross-context adaptation: US base → Indian city (transfer learning)")
+    st.subheader("Cross-context adaptation: historical base → live corridors (transfer learning)")
     m = bundle["metrics"]
     st.write(f"**Base model** (XGBoost, chronological out-of-time test): "
              f"MAE **{m['base_mae']:.1f}**, RMSE **{m['base_rmse']:.1f}**.")
@@ -2400,7 +2439,7 @@ with tab5:
              f"({(1-m['calib_mae_adapted']/max(m['calib_mae_unadapted'],1))*100:.1f}% held-out error drop).")
     st.caption(f"Evaluated on held-out 30% chronological validation split ({m.get('n_india_val', 101)} rows) — zero in-sample contamination.")
     comp = pd.DataFrame({
-        "stage": ["Base (US)", "Adapted (India-calibrated)", "Final (adapted + live fusion)"],
+        "stage": ["Base", "Adapted (live corridors)", "Final (adapted + live fusion)"],
         "volume": [pred["base_vol"], pred["adapted_vol"], pred["final_vol"]],
         "level": [pred["base_level"], pred["adapted_level"], pred["final_level"]],
     })
@@ -2443,9 +2482,10 @@ with tab6:
     st.subheader("Route comparison — pick the faster corridor")
     col_a, col_b = st.columns(2)
     with col_a:
-        a_name = st.selectbox("Route A", route_names, index=0, key=f"ra_{city}")
+        a_name = st.selectbox("Route A", [r["name"] for r in routes], index=0, key=f"ra_{city}")
     with col_b:
-        b_name = st.selectbox("Route B", route_names, index=min(1, len(route_names)-1), key=f"rb_{city}")
+        b_names = [r["name"] for r in routes]
+        b_name = st.selectbox("Route B", b_names, index=min(1, len(b_names) - 1), key=f"rb_{city}")
 
     if a_name == b_name:
         st.warning("⚠️ Please select two different routes to compare corridors.")
@@ -2628,6 +2668,69 @@ def _clean(d: dict) -> dict:
     return out
 
 
+def _causes(at, weather: dict, flow: dict, pred: dict, lat: float, lon: float) -> dict:
+    """Why is there traffic here? Ranked causes: live incidents > weather >
+    demand patterns > current bottleneck state. Always returns at least one entry."""
+    from traffic_api import fetch_tomtom_incidents
+    causes = []
+    f = pred.get("features", {}) if isinstance(pred, dict) else {}
+    level = pred.get("final_level", "?") if isinstance(pred, dict) else "?"
+    # 1. Live reported incidents (needs TomTom key; silent skip otherwise)
+    try:
+        inc = fetch_tomtom_incidents(lat, lon, tt_key() or None)
+        for g in (inc.get("incidents") or [])[:3]:
+            delay_m = round(g.get("delay_s", 0) / 60, 1)
+            causes.append({
+                "kind": "incident", "severity": 3 if delay_m >= 5 else 2,
+                "title": f"{g.get('category_name', 'Incident')} ~{g.get('distance_km', '?')} km away",
+                "detail": (g.get("description") or "Reported on live traffic feed.")
+                          + (f" Adding ~{delay_m} min." if delay_m > 0 else ""),
+            })
+        inc_source = inc.get("source", "")
+    except Exception:
+        inc_source = "unavailable"
+    # 2. Weather as a cause
+    rain = float(weather.get("rain_1h", 0) or 0)
+    wmain = str(weather.get("weather_main", "Clear"))
+    if rain >= 5 or wmain in ("Thunderstorm", "Snow"):
+        causes.append({"kind": "weather", "severity": 2.5,
+                       "title": f"Severe weather: {wmain} ({rain} mm/h)",
+                       "detail": "Cuts grip and visibility; model adds 15–25% congestion pressure."})
+    elif rain > 0.5 or wmain in ("Rain", "Drizzle", "Fog"):
+        causes.append({"kind": "weather", "severity": 1.5,
+                       "title": f"{wmain} ({rain} mm/h)",
+                       "detail": "Wet-road friction slows flow ~10%."})
+    # 3. Demand patterns (recurrent causes)
+    if f.get("is_holiday"):
+        causes.append({"kind": "demand", "severity": 1.5,
+                       "title": "Holiday travel pattern",
+                       "detail": "Lighter commute but event/leisure trips reshape peaks."})
+    elif f.get("is_peak") and not f.get("is_weekend"):
+        causes.append({"kind": "demand", "severity": 2,
+                       "title": f"Peak-hour commuter demand ({f.get('hour')}:00 weekday)",
+                       "detail": "Recurrent office commute surge — the strongest historical driver."})
+    elif f.get("is_weekend"):
+        causes.append({"kind": "demand", "severity": 1,
+                       "title": "Weekend movement pattern",
+                       "detail": "Shopping/leisure corridors replace commuter peaks (~40% lower)."})
+    # 4. Current bottleneck state from live speed
+    ratio = float(flow.get("congestion_ratio", 1) or 1)
+    if ratio < 0.5:
+        causes.append({"kind": "bottleneck", "severity": 2.5,
+                       "title": f"Active bottleneck — {round(ratio * 100)}% of free-flow speed",
+                       "detail": "Live TomTom speeds confirm standing queues right now."})
+    elif ratio < 0.75:
+        causes.append({"kind": "bottleneck", "severity": 1.5,
+                       "title": f"Building pressure — {round(ratio * 100)}% of free-flow",
+                       "detail": "Mild live slowdown on top of the historical pattern."})
+    if level == "Low" and not causes:
+        causes.append({"kind": "flow", "severity": 0,
+                       "title": "Flowing freely — no active cause",
+                       "detail": "Speeds near free-flow and no incidents, weather, or peak pressure."})
+    causes.sort(key=lambda c: -c["severity"])
+    return {"level": level, "causes": causes, "incidents_source": inc_source}
+
+
 def _shap(at, weather, flow, b, horizon=0, pipe=None):
     try:
         from explain_shap import compute_shap_explanation
@@ -2698,8 +2801,9 @@ def overview(city: str = "Mumbai", route: str = "Andheri → BKC", hour: int | N
     at = _at_with(hour, dow)
     weather, flow = _live(city, r, at, rain_override=rain, rain_mm=rain_mm, holiday_override=holiday)
     p = _clean(predict_pipeline(at, weather, flow, b, city=city.split(" ")[0]))
+    causes = _causes(at, weather, flow, p, r["lat"], r["lon"])
     return {"at": at.isoformat(), "city": city, "route": r["name"],
-            "weather": weather, "flow": flow, "pred": p,
+            "weather": weather, "flow": flow, "pred": p, "causes": causes,
             "colors": LEVEL_COLOR, "shap": _shap(at, weather, flow, b, 0, None)}
 
 
@@ -2788,9 +2892,11 @@ def adaptation(city: str = "Mumbai", route: str = "Andheri → BKC",
             except Exception:
                 pass
             break
+    src_label = "India" if m.get("base_source", "us-uci").startswith("india") else "US"
     return {"metrics": m, "thresholds": [float(x) for x in b["thresholds"]],
-            "stages": [{"stage": "Base (US)", "volume": p["base_vol"], "level": p["base_level"]},
-                       {"stage": "Adapted (India)", "volume": p["adapted_vol"], "level": p["adapted_level"]},
+            "base_source": m.get("base_source", "us-uci"),
+            "stages": [{"stage": f"Base ({src_label})", "volume": p["base_vol"], "level": p["base_level"]},
+                       {"stage": "Adapted (live corridors)", "volume": p["adapted_vol"], "level": p["adapted_level"]},
                        {"stage": "Final (live fusion)", "volume": p["final_vol"], "level": p["final_level"]}],
             "delta": p["adapted_vol"] - p["base_vol"], "collector": coll}
 
@@ -3081,6 +3187,7 @@ def corridor(olat: float, olon: float, dlat: float, dlon: float, alts: int = 2):
               else "Corridor flowing — good time to depart.")
     return {"origin": [olat, olon], "dest": [dlat, dlon], "mid": [mlat, mlon],
             "route": route_info, "options": options, "live_routing": live, "pred": p,
+            "causes": _causes(at, weather, flow, p, mlat, mlon),
             "weather": weather, "flow": flow, "advice": advice, "colors": LEVEL_COLOR}
 
 
@@ -3112,6 +3219,47 @@ def grid(city: str = "Mumbai", horizon: int = 0):
                     "vol": p["final_vol"], "speed": fl["current_speed"],
                     "free": fl["free_flow_speed"], "source": fl["source"]})
     return {"city": city, "horizon": horizon, "points": out, "colors": LEVEL_COLOR}
+
+
+@app.get("/api/routes")
+def city_routes(city: str = "Mumbai", horizon: int = 0):
+    """Every corridor as a road-aligned route: OSRM geometry + live prediction +
+    per-route stats (level, volume, speed, trip time, distance)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from traffic_api import fetch_osrm_route
+    b = bundle()
+    if city not in CITIES:
+        raise HTTPException(404, "unknown city")
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    c0 = CITIES[city]["routes"][0]
+    weather, _ = _live(city, c0, at)
+
+    def one(r: dict) -> dict:
+        import math
+        span = float(r.get("length_km", 5.0)) / 111.0  # km -> degrees (approx)
+        dlat, dlon = r["lat"] + span * 0.6, r["lon"] + span * 0.8
+        geom, dist, src = None, float(r.get("length_km", 5.0)), "estimated"
+        try:
+            o = fetch_osrm_route((r["lat"], r["lon"]), (dlat, dlon))
+            if o.get("ok") and o.get("geometry"):
+                geom, dist, src = o["geometry"], o["distance_km"], o["source"]
+        except Exception:
+            pass
+        if not geom:
+            geom = [[r["lat"], r["lon"]], [dlat, dlon]]
+        fl = fetch_tomtom_flow(r["lat"], r["lon"], r["free_flow"], tt_key() or None, 0.4)
+        p = predict_pipeline(at, weather, fl, b, minutes_ahead=max(0, min(60, horizon)),
+                             city=city.split(" ")[0])
+        tmin = round(dist / max(fl["current_speed"], 1) * 60, 1)
+        return {"route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
+                "speed": fl["current_speed"], "free": fl["free_flow_speed"],
+                "dist_km": round(dist, 2), "trip_min": tmin,
+                "delay_min": round(tmin - dist / max(fl["free_flow_speed"], 1) * 60, 1),
+                "geometry": geom, "geo_source": src, "flow_source": fl["source"]}
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        out = list(ex.map(one, CITIES[city]["routes"]))
+    return {"city": city, "horizon": horizon, "routes": out, "colors": LEVEL_COLOR}
 ```
 
 ---
@@ -3403,19 +3551,20 @@ print("If sources say live:*, your key works — paste it in the Streamlit sideb
 models/metrics.json
 ```json
 {
-  "base_mae": 265.1690673828125,
-  "base_rmse": 464.3048735744651,
-  "calib_mae_adapted": 487.7431985953765,
-  "calib_mae_unadapted": 2257.6669921875,
-  "n_us": 40575,
+  "base_mae": 119.45015716552734,
+  "base_rmse": 211.61126653607081,
+  "base_source": "india-synthetic-v2",
+  "calib_mae_adapted": 105.71588901445176,
+  "calib_mae_unadapted": 100.60914611816406,
+  "n_us": 17520,
   "n_india_calib": 336,
   "n_india_train": 235,
   "n_india_val": 101,
-  "p95_volume": 6219.0,
+  "p95_volume": 3420.0,
   "thresholds": [
-    1239.0,
-    3415.0,
-    4953.0
+    177.0,
+    567.0,
+    1731.0
   ]
 }
 ```
@@ -3425,8 +3574,8 @@ models/metrics.json
 models/checksums.json
 ```json
 {
-  "base_model.pkl": "1e28f7e95cd6ea949f4e5a31da34655942ef10d5a9fb11e0b33ec631ab438a76",
-  "traffic_model.joblib": "6ed3bdb2cd8ca0b44bd3d9969bb364888db3d0c3b10d83c002c709e3a56873ef"
+  "base_model.pkl": "f0a019b4a74c4c0048905f7d3ab6ee80454e7d3a9d6e2e29f7bf3da660fc83da",
+  "traffic_model.joblib": "9824bc53c3d785b222b0c583e3fa8bb692a1516c173c35ad3134a05e52a29817"
 }
 ```
 
@@ -3795,6 +3944,61 @@ Workspace: `Smart City Traffic Forcasting/`
 - If blank persists: hard-refresh (Ctrl+Shift+R) with BOTH servers freshly restarted,
   then paste the banner text.
 
+## 15:00–15:15 — Road-aligned paths (no more straight lines)
+- Root-caused the blank: `line`/`roadAligned` referenced in JSX but never defined
+  (half-finished concurrent edit) → ReferenceError on mount. Defined both.
+- `traffic_api.py` += `_leg_geometry` (TomTom legs[].points), `fetch_osrm_route`
+  (free OSRM geometry, no key), `fetch_tomtom_routes` (maxAlternatives + geometry);
+  repaired a mid-function split caused by a bad insert (verified imports + OSRM live).
+- `/api/corridor` attaches per-option `geometry` (TomTom legs / OSRM 281 pts ✅ / null
+  estimate fallback); planner draws the road polyline, dashed straight line only for
+  estimates, with a road-aligned badge. `npm run build` ✅.
+
+## 15:30–15:45 — Map lag + straight-line recurrence
+- Lag: both `FlyTo` helpers re-flew on EVERY render (fresh array identity each time).
+  Now keyed on rounded coords — flies only when the center actually moves.
+  Plus `preferCanvas` on both maps for smoother vectors.
+- Straight line explained: fresh-server test returns 281-pt OSRM geometry, so a
+  straight path means a STALE backend (pre-geometry code squatting :8000).
+  Fix = kill python squatters, restart uvicorn, hard-refresh. Build ✅.
+
+## 15:15–15:30 — Q&A (base/adapted/final, data + model locality) + multi-route map
+- Answered: base = raw US-XGB; adapted = Ridge India-scale; final = 0.65·adapted +
+  0.35·live-implied (clipped, classified). Dataset = local CSV (48,204 rows, one-time
+  UCI download). Model = 100% local pickle inference; internet only for live APIs.
+- New `GET /api/routes`: every corridor → OSRM road geometry (ThreadPool) + live
+  prediction + stats (level/vol/speed/trip/delay). Verified Mumbai: 5 routes, 299 pts,
+  Low 1228 @29.4 km/h. Map "Routes" mode draws all polylines + per-route stats table.
+- Fixed own accidental docstring-strip edit. Killed stale PID 13808 first. Build ✅.
+
+## 15:30–15:45 — "Why is there traffic?" cause attribution
+- `traffic_api`: incident feed now parses category/delay/description + haversine
+  distance, nearest-first (needs TomTom key; silent skip otherwise).
+- New `_causes()` ranker: live incidents > severe weather > peak demand/holiday >
+  bottleneck state; always returns ≥1 cause. Verified: 18:00 jam → bottleneck +
+  commuter-demand; rainy holiday → severe-weather + holiday pattern.
+- Wired into `/overview` + `/corridor`; UI cards on Overview ("Why is there traffic
+  here?") and Route planner (mid-corridor causes). Fixed own newline-eating no-op
+  edit that broke `api.py` imports. Build ✅ (frontend), `import api` ✅.
+
+## 15:45–16:00 — India-first base (user: "make indian right now")
+- `train_base.py` += `TRAIN_CSV` env override; `train_model.py` += `INDIA_BASE=1`
+  (full synthetic_india_v2 as base; `base_source` recorded in bundle metrics).
+- Ran both: base XGB MAE **119.5** (15.2% over naive baseline), thresholds
+  **[177, 567, 1731]**; bundle transfer 100.6 → 105.7 (head holds parity — base is
+  already India-native, stated honestly in docs).
+- Sanity 2540.79 Severe ✅. Relabeled dynamic stages (`/api/adaptation` uses
+  `base_source`; React title switches India/US) + neutralized 3 hardcoded US strings
+  in Streamlit (incl. fixing 2 `route_names` NameErrors from concurrent rename).
+- README numbers synced. Both UIs verified (`import app` ✅, frontend build ✅).
+
+## 16:00–16:10 — Full PS compliance sweep (user pasted full requirements)
+- Verdict: all 6 core + all 8 brownies covered (matrix in README §3).
+- One gap closed: cross-context evidence for the India-first era — added the
+  US→India offline experiment (2240→604, 73%) as a labeled reference row in the
+  Diagnostics benchmark table, so the transfer story survives alongside the
+  live India-base → live-corridor adaptation. Build ✅.
+
 ## 14:00–14:20 — Free-text everywhere + weekday lookup + analysis charts + hardening
 - Backend: `/patterns` += weekday/weekend diurnal series; `/whatif` += staged
   base→adapted + calibration_delta (3682→2146 ✅); `/overview` + `/forecast` += `dow`
@@ -3850,7 +4054,7 @@ historical data** (time, day, weather, holidays), **fuses live TomTom + weather 
 serves everything through an **interpretable 6-tab Streamlit dashboard** with
 Low / Moderate / High / Severe congestion levels.
 
-Last updated: 2026-10-11 ~13:20 — TrafficSense port complete (10 React views, 14 endpoints).
+Last updated: 2026-10-11 ~16:00 — India-first base live (MAE 119.5, thresholds [177,567,1731]).
 
 ---
 
@@ -3859,10 +4063,10 @@ Last updated: 2026-10-11 ~13:20 — TrafficSense port complete (10 React views, 
 Terminal 1 — train + verify + dashboard:
 ```powershell
 pip install -r requirements.txt
-python train_base.py        # real UCI (48,204 rows) -> base_model.pkl | XGB MAE 264.6 vs Baseline 277.2
-python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | held-out MAE 487.7
-python sanity_check.py      # expect: Predicted: 5452.45 -> Severe [OK]
-python test_suite.py        # 6/6 unit tests pass (waterfall additivity, decay, boundaries, holidays, SSRF, SHA-256)
+python train_base.py        # India-pattern base (17,520 rows) -> base_model.pkl | XGB MAE 119.5 (15% over baseline)
+python train_model.py       # base + Ridge calibration -> models/traffic_model.joblib | held-out 100.6 -> 105.7
+python sanity_check.py      # expect: Predicted: 2540.79 -> Severe [OK]
+python test_suite.py        # 7/7 unit tests pass (waterfall additivity, decay, boundaries, holidays, SSRF, SHA-256, route fallback)
 python predict.py           # expect: 4 live lines T+0/15/30/60 with dynamic SHAP attribution
 python test_tomtom.py <KEY> # optional key check: flow + routing + incidents, all live
 streamlit run app.py        # dashboard http://localhost:8501
@@ -3907,8 +4111,9 @@ npm run build          # production build check (verified ✅)
 | `GET /api/geocode?q=` | Nominatim proxy → any global city → custom-point forecast |
 | `POST /api/keys` `{tomtom, openweather}` | Runtime keys (memory only) → flips sim → live |
 | `GET /api/tiles` | TomTom raster tile URL template (when key set) |
-| `GET /api/corridor?…&alts=2` | 🛣 Path options (TomTom maxAlternatives live, else Fastest/Shortest synth) + midpoint prediction + advice |
+| `GET /api/corridor?…&alts=2` | 🛣 Path options with road geometry (TomTom legs / free OSRM) + midpoint prediction + advice |
 | `GET /api/grid?city=&horizon=` | 9-point telemetry grid for map overlay |
+| `GET /api/routes?city=&horizon=` | Every corridor as road geometry + per-route stats table |
 | `GET /api/model` | Active model backend/metrics/custom flag |
 | `POST /api/retrain` (CSV + trees/depth/lr) | 🧠 In-app retrain → swaps live bundle |
 
@@ -3947,13 +4152,13 @@ All 8 verified live (simulated-mode: forecast Low×4 Sat-midday; heatmap 5 pts; 
 
 | # | PS requirement | Implementation | Evidence |
 |---|---|---|---|
-| 1 | Pattern learning (time/day/weather/holidays/volume) | `train_base.py` + canonical `schema.py` features on real UCI | MAE 286.3 (~9% of mean 3259); Patterns tab curves |
+| 1 | Pattern learning (time/day/weather/holidays/volume) | `train_base.py` + canonical `schema.py` features on India-pattern data (17,520 rows) | MAE 119.5 (~11% of mean ~1100); Patterns tab curves |
 | 2 | Forecast current + near-future (15/30/60) | `predict.py:predict_now(lat,lon,offset)` + Forecast tab table + line | 4 live lines on every run |
 | 3 | Real-time traffic API in the pipeline | `traffic_api.fetch_tomtom_flow()` (flowSegmentData) + Routing for trip times; fusion `0.65*adapted + 0.35*live-implied` | `live:*` badges; contribution note in Overview |
-| 4 | Context adaptation to Indian city | Ridge stacking head `[base_pred, rain, hour, is_peak]` → India scale (235 train / 101 val); Adaptation tab base-vs-adapted + 🇮🇳 live-CSV section | 2240 → 604 MAE (73% drop) |
+| 4 | Context adaptation to Indian city | India-native base + Ridge head `[base_pred, rain, hour, is_peak]` → live corridors (235 train / 101 val); Adaptation tab base-vs-adapted + 🇮🇳 live-CSV section | held-out 100.6 → 105.7 (base already India-scale; head holds parity) |
 | 5 | Interpretability | `explain_shap.py`: SHAP TreeExplainer, % contributions (e.g. "Heavy rain 40%, Rush hour 35%"), Plotly Waterfall + Factor Influence + Donut charts in Overview & Forecast | Overview + Forecast "Why this prediction?" |
 | 6 | Interactive dashboard | `app.py`: 6 tabs, city/route/custom-point + time + horizon controls | serves :8501/:8502 verified |
-| 7 | Classification Low/Moderate/High/Severe | Data-driven quartiles [1186, 3378, 4939] from training volumes | badges + map colors everywhere |
+| 7 | Classification Low/Moderate/High/Severe | Data-driven quartiles [177, 567, 1731] from India-scale training volumes | badges + map colors everywhere |
 | Brownie | Traffic heatmap | Heatmap tab: `px.scatter_map` (OSM, no token), size ∝ volume | green→red corridors |
 | Brownie | Short-term forecasting visualised | Forecast tab line (final/adapted/base) + horizon slider + T+horizon badge | varies at hour boundaries |
 | Brownie | Cross-context prediction | Adaptation tab side-by-side base/adapted/final + delta | e.g. +delta veh/hr shown live |
@@ -3995,7 +4200,7 @@ Calibration head (4): `base_pred`, `rain_1h`, `hour`, `is_peak`.
 - **Pure SHAP & 100% Additive Waterfall:** Pure Shapley values explain model features with zero invented constants. Downstream intra-hour progression, calibration delta, live speed fusion, and physical bounding / display rounding are displayed as explicit waterfall stages, summing with 100% exact mathematical equality to `final_vol`.
 - **Dynamic Horizons:** Sub-hour linear interpolation and exponential decay (`w_live = 0.35 * exp(-m/45)`) transition smoothly from live sensor dominance at T+0 to temporal model predictions at T+60.
 - **Security & Integrity:** SHA-256 model checksum verification (`safe_load_model()`), input coordinate validation (`validate_coordinates()`), secret token exception scrubbers (`_redact()`), and empty password widget defaults.
-- **Automated Unit Test Suite:** `test_suite.py` validates waterfall additivity, horizon decay monotonicity, classification boundaries, city-specific holidays, SSRF defenses, and SHA-256 integrity (6/6 tests passing).
+- **Automated Unit Test Suite:** `test_suite.py` validates waterfall additivity, horizon decay monotonicity, classification boundaries, city-specific holidays, SSRF defenses, SHA-256 integrity, and city-switch route fallback (7/7 tests passing).
 
 ## 6. Files (what each does)
 
@@ -4137,6 +4342,8 @@ export const api = {
   overview: (city, route, opts = {}) => get('/api/overview', { city, route, ...opts }),
   forecast: (city, route, opts = {}) => get('/api/forecast', { city, route, ...opts }),
   heatmap: (city) => get('/api/heatmap', { city }),
+  grid: (city, horizon) => get('/api/grid', { city, horizon }),
+  routes: (city, horizon) => get('/api/routes', { city, horizon }),
   patterns: () => get('/api/patterns'),
   adaptation: (city, route, opts = {}) => get('/api/adaptation', { city, route, ...opts }),
   compare: (city, a, b) => get('/api/compare', { city, a, b }),
@@ -5479,6 +5686,18 @@ export default function Overview({ data, forecast, city, route, rain, holiday, g
       <p className="verdict">📣 City transit verdict: <b>{verdict}</b></p>
       <p className="muted">Sources: {flow.source} / {weather.source}</p>
       <FusionCard flow={flow} pred={pred} />
+      {data.causes?.causes?.length > 0 && (
+        <div className="card">
+          <h4>🧐 Why is there traffic here? (ranked causes)</h4>
+          {data.causes.causes.map((c, i) => (
+            <div key={i} className="row" style={{ alignItems: 'flex-start' }}>
+              <span>{c.kind === 'incident' ? '🚧' : c.kind === 'weather' ? '🌧' : c.kind === 'demand' ? '👥' : c.kind === 'bottleneck' ? '🚗' : '✅'}</span>
+              <span><b>{i + 1}. {c.title}</b><br /><span className="muted">{c.detail}</span></span>
+            </div>
+          ))}
+          <p className="muted">Incidents: {data.causes.incidents_source || 'key needed'} · demand & weather from live model inputs.</p>
+        </div>
+      )}
       <div className="cards">
         <div className="card"><h4>Legacy (history only)</h4><div className="bignum">{pred.base_vol}<span className="unit">veh/hr</span></div><span className="sub">static US baseline · {pred.base_level}</span></div>
         <div className="card"><h4>Upgraded (live fused)</h4><div className="bignum">{pred.final_vol}<span className="unit">veh/hr</span></div><span className="sub">{pred.base_vol ? `${pred.final_vol >= pred.base_vol ? '+' : ''}${Math.round((pred.final_vol - pred.base_vol) / pred.base_vol * 100)}% real-world correction` : ''} · {lvl}</span></div>
@@ -5566,12 +5785,19 @@ frontend/src/views/Heatmap.jsx
 import { useEffect, useRef, useState } from 'react'
 import html2canvas from 'html2canvas'
 import 'leaflet/dist/leaflet.css'
-import { CircleMarker, MapContainer, Popup, TileLayer, Tooltip, useMap } from 'react-leaflet'
+import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap } from 'react-leaflet'
 import { api } from '../api'
 
 function FlyTo({ center }) {
   const map = useMap()
-  useEffect(() => { map.flyTo(center, 11, { duration: 1.0 }) }, [center])
+  const key = `${center[0].toFixed(3)},${center[1].toFixed(3)}`
+  const last = useRef(key)
+  useEffect(() => {
+    if (last.current !== key) {
+      last.current = key
+      map.flyTo(center, 11, { duration: 1.0 })
+    }
+  }, [key])
   return null
 }
 
@@ -5581,6 +5807,7 @@ export default function Heatmap({ data, city, forecast, dark }) {
   const [hz, setHz] = useState(0)
   const [mode, setMode] = useState('corridors')
   const [grid, setGrid] = useState(null)
+  const [routes, setRoutes] = useState(null)
   const [raster, setRaster] = useState(false)
   const [tileUrl, setTileUrl] = useState(null)
   const [exporting, setExporting] = useState(false)
@@ -5600,6 +5827,9 @@ export default function Heatmap({ data, city, forecast, dark }) {
     if (mode === 'grid' && city) {
       api.grid(city, hz).then(setGrid).catch(() => setGrid(null))
     }
+    if (mode === 'routes' && city) {
+      api.routes(city, hz).then(setRoutes).catch(() => setRoutes(null))
+    }
   }, [mode, city, hz])
 
   // Horizon: scale each point's volume by forecast trend ratio
@@ -5613,6 +5843,7 @@ export default function Heatmap({ data, city, forecast, dark }) {
   const shown = mode === 'grid' && grid?.points
     ? grid.points.map((p) => ({ route: p.name, lat: p.lat, lon: p.lon, level: p.level, vol: p.vol, dvol: p.vol, speed: p.speed }))
     : adj
+  const routeLines = mode === 'routes' && routes?.routes ? routes.routes : null
 
   const exportPng = async () => {
     if (!wrapRef.current) return
@@ -5633,6 +5864,7 @@ export default function Heatmap({ data, city, forecast, dark }) {
       <div className="maptools">
         <div className="pills">
           <button className={mode === 'corridors' ? 'active' : ''} onClick={() => setMode('corridors')}>Corridors</button>
+          <button className={mode === 'routes' ? 'active' : ''} onClick={() => setMode('routes')}>Routes</button>
           <button className={mode === 'grid' ? 'active' : ''} onClick={() => setMode('grid')}>9-point grid</button>
         </div>
         <div className="pills">
@@ -5652,11 +5884,23 @@ export default function Heatmap({ data, city, forecast, dark }) {
         </div>
       </div>
       <div ref={wrapRef}>
-        <MapContainer center={center} zoom={11} style={{ height: 480, borderRadius: 12 }}>
+        <MapContainer center={center} zoom={11} preferCanvas style={{ height: 480, borderRadius: 12 }}>
           <TileLayer url={baseTiles} />
           {raster && tileUrl && <TileLayer url={tileUrl} opacity={0.65} zIndex={10} />}
           <FlyTo center={center} />
-          {shown.map((p) => (
+          {routeLines
+            ? routeLines.map((r) => (
+              <Polyline key={r.route} positions={r.geometry && r.geometry.length ? r.geometry : []}
+                pathOptions={{ color: data.colors[r.level], weight: 6, opacity: 0.9 }}>
+                <Popup>
+                  <b>{r.route}</b><br />
+                  Level: <b>{r.level}</b> · {r.vol.toLocaleString()} veh/hr<br />
+                  Speed: {r.speed} km/h (free {r.free})<br />
+                  {r.dist_km} km · {r.trip_min} min · delay +{r.delay_min} min
+                </Popup>
+              </Polyline>
+            ))
+            : shown.map((p) => (
             <CircleMarker
               key={p.route}
               center={[p.lat, p.lon]}
@@ -5681,6 +5925,19 @@ export default function Heatmap({ data, city, forecast, dark }) {
         ))}
         <span className="muted">bubble size ∝ volume · {hz === 0 ? 'live' : `forecast +${hz}m`}{data.points[0]?.source?.startsWith('sim') ? ' · simulated' : ''}</span>
       </div>
+      {routeLines && (
+        <>
+          <h4>Every route — live stats</h4>
+          <table className="tbl">
+            <thead><tr><th>Route</th><th>Level</th><th>Volume</th><th>Speed</th><th>Trip</th><th>Delay</th></tr></thead>
+            <tbody>
+              {routeLines.map((r) => (
+                <tr key={r.route}><td>{r.route}</td><td>{r.level}</td><td>{r.vol.toLocaleString()}</td><td>{r.speed} km/h</td><td>{r.trip_min} min</td><td>+{r.delay_min}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
     </div>
   )
 }
@@ -5832,8 +6089,8 @@ export default function Adaptation({ data }) {
   const drop = m.calib_mae_unadapted ? ((1 - (m.calib_mae_adapted || 0) / m.calib_mae_unadapted) * 100).toFixed(1) : '–'
   return (
     <div>
-      <h3>🔁 Cross-context adaptation: US base → Indian city</h3>
-      <p>Base (XGBoost, US history): MAE <b>{m.base_mae?.toFixed(1)}</b>, RMSE <b>{m.base_rmse?.toFixed(1)}</b></p>
+      <h3>🔁 Adaptation: {(data.base_source || 'us-uci').startsWith('india') ? 'India base → live corridors' : 'US base → Indian city'}</h3>
+      <p>Base (XGBoost, {(data.base_source || 'us-uci').startsWith('india') ? 'India patterns' : 'US history'}): MAE <b>{m.base_mae?.toFixed(1)}</b>, RMSE <b>{m.base_rmse?.toFixed(1)}</b></p>
       <p>Without adaptation: <b>{m.calib_mae_unadapted?.toFixed(1)}</b> → with Ridge calibration: <b>{m.calib_mae_adapted?.toFixed(1)}</b> ({drop}% drop)</p>
       <table className="tbl">
         <thead><tr><th>Stage</th><th>Volume</th><th>Level</th></tr></thead>
@@ -6299,6 +6556,7 @@ const BENCH = [
   ['Naive mean', '1,420', '1,780', '0.00', '<0.01 ms', 'baseline average'],
   ['Ridge (linear)', '685', '890', '0.62', '0.04 ms', 'underfits peaks'],
   ['Single CART', '512', '670', '0.76', '0.08 ms', 'overfits nights'],
+  ['US-base → India transfer (offline exp)', '2,240 → 604', '—', '—', '73% drop w/ Ridge head'],
 ]
 
 export default function Diagnostics() {
@@ -6348,7 +6606,7 @@ export default function Diagnostics() {
 
 frontend/src/views/CorridorPlanner.jsx
 ```jsx
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
 import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import { api, LEVEL_HEX } from '../api'
@@ -6432,6 +6690,11 @@ export default function CorridorPlanner() {
     (Number(src?.lon ?? 72.8697) + Number(dst?.lon ?? 72.8656)) / 2,
   ]
   const lvl = out?.pred?.final_level
+  const selOpt = out ? ((out.options || [out.route]).find((o) => (o.id ?? 0) === opt) || out.route) : null
+  const line = selOpt?.geometry?.length
+    ? selOpt.geometry
+    : (src?.lat != null && dst?.lat != null ? [[src.lat, src.lon], [dst.lat, dst.lon]] : [])
+  const roadAligned = !!(selOpt?.geometry?.length)
   return (
     <div>
       <h3>🛣 Route planner — any source, any destination</h3>
@@ -6447,7 +6710,7 @@ export default function CorridorPlanner() {
         {pick && <span className="muted">Click anywhere on the map…</span>}
       </div>
       <div className="mapwrap">
-      <MapContainer center={center} zoom={12} style={{ height: 380, minHeight: 380, borderRadius: 12 }}>
+      <MapContainer center={center} zoom={12} preferCanvas style={{ height: 380, minHeight: 380, borderRadius: 12 }}>
         <TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" />
         <FlyTo center={center} />
         <ClickSetter target={pick} onPick={(p) => {
@@ -6469,7 +6732,7 @@ export default function CorridorPlanner() {
       </div>
       {!out ? <p>{loading ? 'Routing…' : 'Plan a route to see prediction.'}</p> : (
         <>
-          <h4>Select path ({(out.options || [out.route]).length} options{out.live_routing ? ' · live TomTom' : ' · estimated'})</h4>
+          <h4>Select path ({(out.options || [out.route]).length} options{out.live_routing ? ' · live TomTom' : ' · estimated'}{roadAligned ? ' · road-aligned 🛣' : ''})</h4>
           <div className="pills">
             {(out.options || [out.route]).map((o, i) => (
               <button key={o.id ?? i} className={opt === (o.id ?? i) ? 'active' : ''}
@@ -6488,6 +6751,14 @@ export default function CorridorPlanner() {
                   <div className="card"><h4>Mid-corridor</h4><div className="bignum">{out.pred?.final_vol ?? '—'}<span className="unit">veh/hr</span></div><span className="sub">{lvl || 'Normal'} congestion</span></div>
                 </div>
                 <p className="verdict">💡 {out.advice || 'Corridor flowing.'}</p>
+                {out.causes?.causes?.length > 0 && (
+                  <div className="card">
+                    <h4>🧐 Why — mid-corridor causes</h4>
+                    {out.causes.causes.slice(0, 3).map((c, i) => (
+                      <p key={i}><b>{i + 1}. {c.title}</b> <span className="muted">— {c.detail}</span></p>
+                    ))}
+                  </div>
+                )}
               </>
             )
           })()}

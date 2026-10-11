@@ -27,7 +27,11 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 def main() -> None:
     os.makedirs(MODEL_DIR, exist_ok=True)
-    us = add_features(load_historical(indian_style=False))
+    # INDIA-first override: INDIA_BASE=1 trains the base on full India-pattern
+    # synthetic data instead of US UCI (calibration story becomes India -> live corridors).
+    india_first = os.environ.get("INDIA_BASE", "") == "1"
+    us = add_features(load_historical(indian_style=india_first))
+    base_source = "india-synthetic-v2" if india_first else "us-uci"
     if "date_time" in us.columns:
         us = us.drop_duplicates(subset=["date_time"]).sort_values("date_time").reset_index(drop=True)
 
@@ -100,6 +104,7 @@ def main() -> None:
         "weather_code": WEATHER_CODE,
         "metrics": {
             "base_mae": mae, "base_rmse": rmse,
+            "base_source": base_source,
             "calib_mae_adapted": mae_adap, "calib_mae_unadapted": mae_unadap,
             "n_us": int(len(us)), "n_india_calib": int(len(india_small)),
             "n_india_train": int(len(ind_tr)), "n_india_val": int(len(ind_val)),

@@ -278,6 +278,61 @@ Workspace: `Smart City Traffic Forcasting/`
 - If blank persists: hard-refresh (Ctrl+Shift+R) with BOTH servers freshly restarted,
   then paste the banner text.
 
+## 15:00–15:15 — Road-aligned paths (no more straight lines)
+- Root-caused the blank: `line`/`roadAligned` referenced in JSX but never defined
+  (half-finished concurrent edit) → ReferenceError on mount. Defined both.
+- `traffic_api.py` += `_leg_geometry` (TomTom legs[].points), `fetch_osrm_route`
+  (free OSRM geometry, no key), `fetch_tomtom_routes` (maxAlternatives + geometry);
+  repaired a mid-function split caused by a bad insert (verified imports + OSRM live).
+- `/api/corridor` attaches per-option `geometry` (TomTom legs / OSRM 281 pts ✅ / null
+  estimate fallback); planner draws the road polyline, dashed straight line only for
+  estimates, with a road-aligned badge. `npm run build` ✅.
+
+## 15:30–15:45 — Map lag + straight-line recurrence
+- Lag: both `FlyTo` helpers re-flew on EVERY render (fresh array identity each time).
+  Now keyed on rounded coords — flies only when the center actually moves.
+  Plus `preferCanvas` on both maps for smoother vectors.
+- Straight line explained: fresh-server test returns 281-pt OSRM geometry, so a
+  straight path means a STALE backend (pre-geometry code squatting :8000).
+  Fix = kill python squatters, restart uvicorn, hard-refresh. Build ✅.
+
+## 15:15–15:30 — Q&A (base/adapted/final, data + model locality) + multi-route map
+- Answered: base = raw US-XGB; adapted = Ridge India-scale; final = 0.65·adapted +
+  0.35·live-implied (clipped, classified). Dataset = local CSV (48,204 rows, one-time
+  UCI download). Model = 100% local pickle inference; internet only for live APIs.
+- New `GET /api/routes`: every corridor → OSRM road geometry (ThreadPool) + live
+  prediction + stats (level/vol/speed/trip/delay). Verified Mumbai: 5 routes, 299 pts,
+  Low 1228 @29.4 km/h. Map "Routes" mode draws all polylines + per-route stats table.
+- Fixed own accidental docstring-strip edit. Killed stale PID 13808 first. Build ✅.
+
+## 15:30–15:45 — "Why is there traffic?" cause attribution
+- `traffic_api`: incident feed now parses category/delay/description + haversine
+  distance, nearest-first (needs TomTom key; silent skip otherwise).
+- New `_causes()` ranker: live incidents > severe weather > peak demand/holiday >
+  bottleneck state; always returns ≥1 cause. Verified: 18:00 jam → bottleneck +
+  commuter-demand; rainy holiday → severe-weather + holiday pattern.
+- Wired into `/overview` + `/corridor`; UI cards on Overview ("Why is there traffic
+  here?") and Route planner (mid-corridor causes). Fixed own newline-eating no-op
+  edit that broke `api.py` imports. Build ✅ (frontend), `import api` ✅.
+
+## 15:45–16:00 — India-first base (user: "make indian right now")
+- `train_base.py` += `TRAIN_CSV` env override; `train_model.py` += `INDIA_BASE=1`
+  (full synthetic_india_v2 as base; `base_source` recorded in bundle metrics).
+- Ran both: base XGB MAE **119.5** (15.2% over naive baseline), thresholds
+  **[177, 567, 1731]**; bundle transfer 100.6 → 105.7 (head holds parity — base is
+  already India-native, stated honestly in docs).
+- Sanity 2540.79 Severe ✅. Relabeled dynamic stages (`/api/adaptation` uses
+  `base_source`; React title switches India/US) + neutralized 3 hardcoded US strings
+  in Streamlit (incl. fixing 2 `route_names` NameErrors from concurrent rename).
+- README numbers synced. Both UIs verified (`import app` ✅, frontend build ✅).
+
+## 16:00–16:10 — Full PS compliance sweep (user pasted full requirements)
+- Verdict: all 6 core + all 8 brownies covered (matrix in README §3).
+- One gap closed: cross-context evidence for the India-first era — added the
+  US→India offline experiment (2240→604, 73%) as a labeled reference row in the
+  Diagnostics benchmark table, so the transfer story survives alongside the
+  live India-base → live-corridor adaptation. Build ✅.
+
 ## 14:00–14:20 — Free-text everywhere + weekday lookup + analysis charts + hardening
 - Backend: `/patterns` += weekday/weekend diurnal series; `/whatif` += staged
   base→adapted + calibration_delta (3682→2146 ✅); `/overview` + `/forecast` += `dow`

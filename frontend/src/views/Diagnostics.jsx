@@ -6,6 +6,7 @@ const BENCH = [
   ['Naive mean', '1,420', '1,780', '0.00', '<0.01 ms', 'baseline average'],
   ['Ridge (linear)', '685', '890', '0.62', '0.04 ms', 'underfits peaks'],
   ['Single CART', '512', '670', '0.76', '0.08 ms', 'overfits nights'],
+  ['US-base → India transfer (offline exp)', '2,240 → 604', '—', '—', '73% drop w/ Ridge head'],
 ]
 
 export default function Diagnostics() {

@@ -137,6 +137,69 @@ def _clean(d: dict) -> dict:
     return out
 
 
+def _causes(at, weather: dict, flow: dict, pred: dict, lat: float, lon: float) -> dict:
+    """Why is there traffic here? Ranked causes: live incidents > weather >
+    demand patterns > current bottleneck state. Always returns at least one entry."""
+    from traffic_api import fetch_tomtom_incidents
+    causes = []
+    f = pred.get("features", {}) if isinstance(pred, dict) else {}
+    level = pred.get("final_level", "?") if isinstance(pred, dict) else "?"
+    # 1. Live reported incidents (needs TomTom key; silent skip otherwise)
+    try:
+        inc = fetch_tomtom_incidents(lat, lon, tt_key() or None)
+        for g in (inc.get("incidents") or [])[:3]:
+            delay_m = round(g.get("delay_s", 0) / 60, 1)
+            causes.append({
+                "kind": "incident", "severity": 3 if delay_m >= 5 else 2,
+                "title": f"{g.get('category_name', 'Incident')} ~{g.get('distance_km', '?')} km away",
+                "detail": (g.get("description") or "Reported on live traffic feed.")
+                          + (f" Adding ~{delay_m} min." if delay_m > 0 else ""),
+            })
+        inc_source = inc.get("source", "")
+    except Exception:
+        inc_source = "unavailable"
+    # 2. Weather as a cause
+    rain = float(weather.get("rain_1h", 0) or 0)
+    wmain = str(weather.get("weather_main", "Clear"))
+    if rain >= 5 or wmain in ("Thunderstorm", "Snow"):
+        causes.append({"kind": "weather", "severity": 2.5,
+                       "title": f"Severe weather: {wmain} ({rain} mm/h)",
+                       "detail": "Cuts grip and visibility; model adds 15–25% congestion pressure."})
+    elif rain > 0.5 or wmain in ("Rain", "Drizzle", "Fog"):
+        causes.append({"kind": "weather", "severity": 1.5,
+                       "title": f"{wmain} ({rain} mm/h)",
+                       "detail": "Wet-road friction slows flow ~10%."})
+    # 3. Demand patterns (recurrent causes)
+    if f.get("is_holiday"):
+        causes.append({"kind": "demand", "severity": 1.5,
+                       "title": "Holiday travel pattern",
+                       "detail": "Lighter commute but event/leisure trips reshape peaks."})
+    elif f.get("is_peak") and not f.get("is_weekend"):
+        causes.append({"kind": "demand", "severity": 2,
+                       "title": f"Peak-hour commuter demand ({f.get('hour')}:00 weekday)",
+                       "detail": "Recurrent office commute surge — the strongest historical driver."})
+    elif f.get("is_weekend"):
+        causes.append({"kind": "demand", "severity": 1,
+                       "title": "Weekend movement pattern",
+                       "detail": "Shopping/leisure corridors replace commuter peaks (~40% lower)."})
+    # 4. Current bottleneck state from live speed
+    ratio = float(flow.get("congestion_ratio", 1) or 1)
+    if ratio < 0.5:
+        causes.append({"kind": "bottleneck", "severity": 2.5,
+                       "title": f"Active bottleneck — {round(ratio * 100)}% of free-flow speed",
+                       "detail": "Live TomTom speeds confirm standing queues right now."})
+    elif ratio < 0.75:
+        causes.append({"kind": "bottleneck", "severity": 1.5,
+                       "title": f"Building pressure — {round(ratio * 100)}% of free-flow",
+                       "detail": "Mild live slowdown on top of the historical pattern."})
+    if level == "Low" and not causes:
+        causes.append({"kind": "flow", "severity": 0,
+                       "title": "Flowing freely — no active cause",
+                       "detail": "Speeds near free-flow and no incidents, weather, or peak pressure."})
+    causes.sort(key=lambda c: -c["severity"])
+    return {"level": level, "causes": causes, "incidents_source": inc_source}
+
+
 def _shap(at, weather, flow, b, horizon=0, pipe=None):
     try:
         from explain_shap import compute_shap_explanation
@@ -207,8 +270,9 @@ def overview(city: str = "Mumbai", route: str = "Andheri → BKC", hour: int | N
     at = _at_with(hour, dow)
     weather, flow = _live(city, r, at, rain_override=rain, rain_mm=rain_mm, holiday_override=holiday)
     p = _clean(predict_pipeline(at, weather, flow, b, city=city.split(" ")[0]))
+    causes = _causes(at, weather, flow, p, r["lat"], r["lon"])
     return {"at": at.isoformat(), "city": city, "route": r["name"],
-            "weather": weather, "flow": flow, "pred": p,
+            "weather": weather, "flow": flow, "pred": p, "causes": causes,
             "colors": LEVEL_COLOR, "shap": _shap(at, weather, flow, b, 0, None)}
 
 
@@ -297,9 +361,11 @@ def adaptation(city: str = "Mumbai", route: str = "Andheri → BKC",
             except Exception:
                 pass
             break
+    src_label = "India" if m.get("base_source", "us-uci").startswith("india") else "US"
     return {"metrics": m, "thresholds": [float(x) for x in b["thresholds"]],
-            "stages": [{"stage": "Base (US)", "volume": p["base_vol"], "level": p["base_level"]},
-                       {"stage": "Adapted (India)", "volume": p["adapted_vol"], "level": p["adapted_level"]},
+            "base_source": m.get("base_source", "us-uci"),
+            "stages": [{"stage": f"Base ({src_label})", "volume": p["base_vol"], "level": p["base_level"]},
+                       {"stage": "Adapted (live corridors)", "volume": p["adapted_vol"], "level": p["adapted_level"]},
                        {"stage": "Final (live fusion)", "volume": p["final_vol"], "level": p["final_level"]}],
             "delta": p["adapted_vol"] - p["base_vol"], "collector": coll}
 
@@ -590,6 +656,7 @@ def corridor(olat: float, olon: float, dlat: float, dlon: float, alts: int = 2):
               else "Corridor flowing — good time to depart.")
     return {"origin": [olat, olon], "dest": [dlat, dlon], "mid": [mlat, mlon],
             "route": route_info, "options": options, "live_routing": live, "pred": p,
+            "causes": _causes(at, weather, flow, p, mlat, mlon),
             "weather": weather, "flow": flow, "advice": advice, "colors": LEVEL_COLOR}
 
 
@@ -621,3 +688,44 @@ def grid(city: str = "Mumbai", horizon: int = 0):
                     "vol": p["final_vol"], "speed": fl["current_speed"],
                     "free": fl["free_flow_speed"], "source": fl["source"]})
     return {"city": city, "horizon": horizon, "points": out, "colors": LEVEL_COLOR}
+
+
+@app.get("/api/routes")
+def city_routes(city: str = "Mumbai", horizon: int = 0):
+    """Every corridor as a road-aligned route: OSRM geometry + live prediction +
+    per-route stats (level, volume, speed, trip time, distance)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from traffic_api import fetch_osrm_route
+    b = bundle()
+    if city not in CITIES:
+        raise HTTPException(404, "unknown city")
+    at = dt.datetime.now().replace(second=0, microsecond=0)
+    c0 = CITIES[city]["routes"][0]
+    weather, _ = _live(city, c0, at)
+
+    def one(r: dict) -> dict:
+        import math
+        span = float(r.get("length_km", 5.0)) / 111.0  # km -> degrees (approx)
+        dlat, dlon = r["lat"] + span * 0.6, r["lon"] + span * 0.8
+        geom, dist, src = None, float(r.get("length_km", 5.0)), "estimated"
+        try:
+            o = fetch_osrm_route((r["lat"], r["lon"]), (dlat, dlon))
+            if o.get("ok") and o.get("geometry"):
+                geom, dist, src = o["geometry"], o["distance_km"], o["source"]
+        except Exception:
+            pass
+        if not geom:
+            geom = [[r["lat"], r["lon"]], [dlat, dlon]]
+        fl = fetch_tomtom_flow(r["lat"], r["lon"], r["free_flow"], tt_key() or None, 0.4)
+        p = predict_pipeline(at, weather, fl, b, minutes_ahead=max(0, min(60, horizon)),
+                             city=city.split(" ")[0])
+        tmin = round(dist / max(fl["current_speed"], 1) * 60, 1)
+        return {"route": r["name"], "level": p["final_level"], "vol": p["final_vol"],
+                "speed": fl["current_speed"], "free": fl["free_flow_speed"],
+                "dist_km": round(dist, 2), "trip_min": tmin,
+                "delay_min": round(tmin - dist / max(fl["free_flow_speed"], 1) * 60, 1),
+                "geometry": geom, "geo_source": src, "flow_source": fl["source"]}
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        out = list(ex.map(one, CITIES[city]["routes"]))
+    return {"city": city, "horizon": horizon, "routes": out, "colors": LEVEL_COLOR}

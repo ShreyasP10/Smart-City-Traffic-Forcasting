@@ -1,12 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import html2canvas from 'html2canvas'
 import 'leaflet/dist/leaflet.css'
-import { CircleMarker, MapContainer, Popup, TileLayer, Tooltip, useMap } from 'react-leaflet'
+import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap } from 'react-leaflet'
 import { api } from '../api'
 
 function FlyTo({ center }) {
   const map = useMap()
-  useEffect(() => { map.flyTo(center, 11, { duration: 1.0 }) }, [center])
+  const key = `${center[0].toFixed(3)},${center[1].toFixed(3)}`
+  const last = useRef(key)
+  useEffect(() => {
+    if (last.current !== key) {
+      last.current = key
+      map.flyTo(center, 11, { duration: 1.0 })
+    }
+  }, [key])
   return null
 }
 
@@ -16,6 +23,7 @@ export default function Heatmap({ data, city, forecast, dark }) {
   const [hz, setHz] = useState(0)
   const [mode, setMode] = useState('corridors')
   const [grid, setGrid] = useState(null)
+  const [routes, setRoutes] = useState(null)
   const [raster, setRaster] = useState(false)
   const [tileUrl, setTileUrl] = useState(null)
   const [exporting, setExporting] = useState(false)
@@ -35,6 +43,9 @@ export default function Heatmap({ data, city, forecast, dark }) {
     if (mode === 'grid' && city) {
       api.grid(city, hz).then(setGrid).catch(() => setGrid(null))
     }
+    if (mode === 'routes' && city) {
+      api.routes(city, hz).then(setRoutes).catch(() => setRoutes(null))
+    }
   }, [mode, city, hz])
 
   // Horizon: scale each point's volume by forecast trend ratio
@@ -48,6 +59,7 @@ export default function Heatmap({ data, city, forecast, dark }) {
   const shown = mode === 'grid' && grid?.points
     ? grid.points.map((p) => ({ route: p.name, lat: p.lat, lon: p.lon, level: p.level, vol: p.vol, dvol: p.vol, speed: p.speed }))
     : adj
+  const routeLines = mode === 'routes' && routes?.routes ? routes.routes : null
 
   const exportPng = async () => {
     if (!wrapRef.current) return
@@ -68,6 +80,7 @@ export default function Heatmap({ data, city, forecast, dark }) {
       <div className="maptools">
         <div className="pills">
           <button className={mode === 'corridors' ? 'active' : ''} onClick={() => setMode('corridors')}>Corridors</button>
+          <button className={mode === 'routes' ? 'active' : ''} onClick={() => setMode('routes')}>Routes</button>
           <button className={mode === 'grid' ? 'active' : ''} onClick={() => setMode('grid')}>9-point grid</button>
         </div>
         <div className="pills">
@@ -87,11 +100,23 @@ export default function Heatmap({ data, city, forecast, dark }) {
         </div>
       </div>
       <div ref={wrapRef}>
-        <MapContainer center={center} zoom={11} style={{ height: 480, borderRadius: 12 }}>
+        <MapContainer center={center} zoom={11} preferCanvas style={{ height: 480, borderRadius: 12 }}>
           <TileLayer url={baseTiles} />
           {raster && tileUrl && <TileLayer url={tileUrl} opacity={0.65} zIndex={10} />}
           <FlyTo center={center} />
-          {shown.map((p) => (
+          {routeLines
+            ? routeLines.map((r) => (
+              <Polyline key={r.route} positions={r.geometry && r.geometry.length ? r.geometry : []}
+                pathOptions={{ color: data.colors[r.level], weight: 6, opacity: 0.9 }}>
+                <Popup>
+                  <b>{r.route}</b><br />
+                  Level: <b>{r.level}</b> · {r.vol.toLocaleString()} veh/hr<br />
+                  Speed: {r.speed} km/h (free {r.free})<br />
+                  {r.dist_km} km · {r.trip_min} min · delay +{r.delay_min} min
+                </Popup>
+              </Polyline>
+            ))
+            : shown.map((p) => (
             <CircleMarker
               key={p.route}
               center={[p.lat, p.lon]}
@@ -116,6 +141,19 @@ export default function Heatmap({ data, city, forecast, dark }) {
         ))}
         <span className="muted">bubble size ∝ volume · {hz === 0 ? 'live' : `forecast +${hz}m`}{data.points[0]?.source?.startsWith('sim') ? ' · simulated' : ''}</span>
       </div>
+      {routeLines && (
+        <>
+          <h4>Every route — live stats</h4>
+          <table className="tbl">
+            <thead><tr><th>Route</th><th>Level</th><th>Volume</th><th>Speed</th><th>Trip</th><th>Delay</th></tr></thead>
+            <tbody>
+              {routeLines.map((r) => (
+                <tr key={r.route}><td>{r.route}</td><td>{r.level}</td><td>{r.vol.toLocaleString()}</td><td>{r.speed} km/h</td><td>{r.trip_min} min</td><td>+{r.delay_min}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
     </div>
   )
 }

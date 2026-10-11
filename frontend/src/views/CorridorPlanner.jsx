@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import 'leaflet/dist/leaflet.css'
 import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet'
 import { api, LEVEL_HEX } from '../api'
@@ -102,7 +102,7 @@ export default function CorridorPlanner() {
         {pick && <span className="muted">Click anywhere on the map…</span>}
       </div>
       <div className="mapwrap">
-      <MapContainer center={center} zoom={12} style={{ height: 380, minHeight: 380, borderRadius: 12 }}>
+      <MapContainer center={center} zoom={12} preferCanvas style={{ height: 380, minHeight: 380, borderRadius: 12 }}>
         <TileLayer url="https://tile.openstreetmap.org/{z}/{x}/{y}.png" />
         <FlyTo center={center} />
         <ClickSetter target={pick} onPick={(p) => {
@@ -143,6 +143,14 @@ export default function CorridorPlanner() {
                   <div className="card"><h4>Mid-corridor</h4><div className="bignum">{out.pred?.final_vol ?? '—'}<span className="unit">veh/hr</span></div><span className="sub">{lvl || 'Normal'} congestion</span></div>
                 </div>
                 <p className="verdict">💡 {out.advice || 'Corridor flowing.'}</p>
+                {out.causes?.causes?.length > 0 && (
+                  <div className="card">
+                    <h4>🧐 Why — mid-corridor causes</h4>
+                    {out.causes.causes.slice(0, 3).map((c, i) => (
+                      <p key={i}><b>{i + 1}. {c.title}</b> <span className="muted">— {c.detail}</span></p>
+                    ))}
+                  </div>
+                )}
               </>
             )
           })()}
